@@ -1,0 +1,94 @@
+name: iOS Build & Sign
+on:
+  workflow_dispatch: # 手动触发打包
+  push:
+    branches: [ master ]
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout 当前打包仓库
+        uses: actions/checkout@v4
+
+      # 拉取私有Gitee Flutter代码，账号token从Secrets读取
+      - name: Clone Gitee 源码
+        run: |
+          git clone https://${{ secrets.GITEE_USER }}:${{ secrets.GITEE_TOKEN }}@gitee.com/yunhaninfo/enjoy-chinese.git source-code
+          cd source-code
+
+      # 配置Flutter 3.16.9
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.16.9'
+          channel: stable
+
+      # 缓存依赖，加快打包速度
+      - name: Cache Flutter & Pods
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.pub-cache
+            ./source-code/enjoychinese_app/.dart_tool
+            ./source-code/enjoychinese_app/ios/Pods
+          key: ${{ runner.os }}-flutter-${{ hashFiles('source-code/enjoychinese_app/pubspec.lock') }}
+
+      # 安装项目依赖
+      - name: Flutter pub get
+        working-directory: ./source-code/enjoychinese_app
+        run: flutter pub get
+
+      # 安装CocoaPods，避免sudo权限问题
+      - name: Install CocoaPods
+        run: brew install cocoapods
+
+      - name: Pod install
+        working-directory: ./source-code/enjoychinese_app/ios
+        run: pod install --repo-update
+
+      # 导入签名证书，全部从Secrets读取，无明文
+      - name: 导入iOS签名证书
+        uses: apple-actions/import-codesign-certs@v2
+        with:
+          p12-file-base64: ${{ secrets.P12_BASE64 }}
+          p12-password: ${{ secrets.P12_PASSWORD }}
+          provisioning-profile-base64: ${{ secrets.PROV_BASE64 }}
+
+      # 生成导出配置，已删除所有#注释，不会报错
+      - name: 生成ExportOptions.plist
+        working-directory: ./source-code/enjoychinese_app/ios
+        run: |
+          cat > ExportOptions.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>development</string>
+            <key>teamID</key>
+            <string>JU3D9VJFCN</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>com.enjoychinese.app</key>
+              <string>671afe2a-a7e4-4b3e-80fc-1d83d57138d7</string>
+            </dict>
+          </dict>
+          </plist>
+          EOF
+
+      # 编译签名IPA
+      - name: Build IPA
+        working-directory: ./source-code/enjoychinese_app
+        run: |
+          flutter build ipa \
+            --release \
+            --export-options-plist=ios/ExportOptions.plist
+
+      # 上传打包产物，可下载
+      - name: 上传IPA安装包
+        uses: actions/upload-artifact@v4
+        with:
+          name: enjoychinese-test-ipa
+          path: ./source-code/enjoychinese_app/build/ios/ipa/*.ipa
