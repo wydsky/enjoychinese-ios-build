@@ -13,7 +13,7 @@ jobs:
       # 拉取私有Gitee Flutter代码，账号token从Secrets读取
       - name: Clone Gitee 源码
         run: |
-          git clone https://${{ secrets.GITEE_USER }}:${{ secrets.GITEE_TOKEN }}@gitee.com/yunhaninfo/enjoy-chinese.git source-code
+          git clone https://oauth2:${{ secrets.GITEE_TOKEN }}@gitee.com/yunhaninfo/enjoy-chinese.git source-code
           cd source-code
 
       # 配置Flutter 3.16.9
