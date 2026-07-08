@@ -20,7 +20,7 @@ jobs:
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.16.9'
+          flutter-version: '3.27.0'
           channel: stable
 
       # 缓存依赖，加快打包速度
@@ -78,17 +78,19 @@ jobs:
           </plist>
           EOF
 
-      # 编译签名IPA
+      # 编译签名IPA（传入环境参数，API地址从Secrets读取避免明文暴露）
       - name: Build IPA
         working-directory: ./source-code/enjoychinese_app
         run: |
           flutter build ipa \
             --release \
+            --dart-define=ENV=prod \
+            --dart-define=PROD_API_HOST=${{ secrets.PROD_API_HOST }} \
             --export-options-plist=ios/ExportOptions.plist
 
       # 上传打包产物，可下载
       - name: 上传IPA安装包
         uses: actions/upload-artifact@v4
         with:
-          name: enjoychinese-test-ipa
+          name: enjoychinese-prod-ipa
           path: ./source-code/enjoychinese_app/build/ios/ipa/*.ipa
