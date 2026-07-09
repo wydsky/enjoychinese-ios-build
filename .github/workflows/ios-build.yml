@@ -14,7 +14,7 @@ jobs:
 
 
 
-    - name: 🔍 排查 Xcode 版本
+    - name: 排查 Xcode 版本
         run: |
           echo "========== /Applications/Xcode*.app =========="
           ls -la /Applications/Xcode*.app 2>/dev/null || echo "No Xcode in /Applications"
