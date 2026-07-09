@@ -12,6 +12,10 @@ jobs:
       - name: Checkout 当前打包仓库
         uses: actions/checkout@v4
 
+       # 切换到 Xcode 16（解决 Firebase SDK Swift 6.0 兼容问题）
+      - name: Select Xcode 16
+        run: sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer
+
       # 拉取私有Gitee Flutter代码，账号token从Secrets读取
       - name: Clone Gitee 源码
         run: |
