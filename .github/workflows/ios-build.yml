@@ -12,35 +12,11 @@ jobs:
       - name: Checkout 当前打包仓库
         uses: actions/checkout@v4
 
-
-
-      - name: 排查 Xcode 版本
-        run: |
-          echo "========== /Applications/Xcode*.app =========="
-          ls -la /Applications/Xcode*.app 2>/dev/null || echo "No Xcode in /Applications"
-          
-          echo ""
-          echo "========== xcode-select current =========="
-          xcode-select -p 2>/dev/null || echo "xcode-select not set"
-          
-          echo ""
-          echo "========== xcodebuild version =========="
-          xcodebuild -version 2>/dev/null || echo "xcodebuild not available"
-          
-          echo ""
-          echo "========== macOS 版本 =========="
-          sw_vers
-          
-          echo ""
-          echo "========== Swift 版本 =========="
-          swift --version 2>/dev/null || echo "swift not available"
-
-
-
-
        # 切换到 Xcode 16（解决 Firebase SDK Swift 6.0 兼容问题）
-      - name: Select Xcode 16
-        run: sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer
+      - name: Select Xcode 16.2
+        run: |
+          sudo xcode-select -s /Applications/Xcode_16.2.app/Contents/Developer
+          xcodebuild -version
 
       # 拉取私有Gitee Flutter代码，账号token从Secrets读取
       - name: Clone Gitee 源码
