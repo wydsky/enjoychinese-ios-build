@@ -12,7 +12,7 @@ jobs:
       - name: Checkout 当前打包仓库
         uses: actions/checkout@v4
 
-       # 切换到 Xcode 16（解决 Firebase SDK Swift 6.0 兼容问题）
+      # 切换到 Xcode 16.2（解决 Firebase SDK Swift 6.0 兼容问题）
       - name: Select Xcode 16.2
         run: |
           sudo xcode-select -s /Applications/Xcode_16.2.app/Contents/Developer
@@ -90,6 +90,64 @@ jobs:
           </dict>
           </plist>
           EOF
+
+      # 配置Xcode项目的Development Team和签名方式（解决Runner Release配置缺少DEVELOPMENT_TEAM问题）
+      - name: 配置Xcode Team ID
+        working-directory: ./source-code/enjoychinese_app/ios
+        run: |
+          python3 << 'PY'
+          import re
+
+          team_id = "JU3D9VJFCN"
+          path = "Runner.xcodeproj/project.pbxproj"
+
+          with open(path, 'r') as f:
+              content = f.read()
+
+          # 在 Runner Target 的 Release buildSettings 中插入 DEVELOPMENT_TEAM 和 CODE_SIGN_STYLE
+          # 匹配 97C147071CF9000F007C117D /* Release */ 的 buildSettings 块
+          def insert_team_release(match):
+              block = match.group(0)
+              if 'DEVELOPMENT_TEAM' in block:
+                  return block
+              insert = f'\n\t\t\t\tDEVELOPMENT_TEAM = {team_id};\n\t\t\t\tCODE_SIGN_STYLE = Manual;'
+              return block.replace(' = {', ' = {' + insert, 1)
+          
+          # 精确匹配 Runner Release 配置
+          content = re.sub(
+              r'97C147071CF9000F007C117D /\* Release \* / = \{\s*isa = XCBuildConfiguration;\s*baseConfigurationReference = [^;]+;\s*buildSettings = \{[^{}]*\}',
+              insert_team_release,
+              content,
+              flags=re.DOTALL
+          )
+
+          # 同时给 Debug 和 Profile 也加上（保险起见）
+          def insert_team(match):
+              block = match.group(0)
+              if 'DEVELOPMENT_TEAM' in block:
+                  return block
+              insert = f'\n\t\t\t\tDEVELOPMENT_TEAM = {team_id};\n\t\t\t\tCODE_SIGN_STYLE = Manual;'
+              return block.replace(' = {', ' = {' + insert, 1)
+          
+          # 匹配所有 Runner Target 的 buildSettings（排除 RunnerTests）
+          content = re.sub(
+              r'(97C147061CF9000F007C117D /\* Debug \* /|97C147071CF9000F007C117D /\* Release \* /|249021D4217E4FDB00AE95B9 /\* Profile \* /) = \{\s*isa = XCBuildConfiguration;[^}]*buildSettings = \{[^{}]*\}',
+              insert_team,
+              content,
+              flags=re.DOTALL
+          )
+
+          with open(path, 'w') as f:
+              f.write(content)
+
+          print("已配置 DEVELOPMENT_TEAM 和 CODE_SIGN_STYLE")
+          
+          # 验证
+          with open(path, 'r') as f:
+              for i, line in enumerate(f, 1):
+                  if 'DEVELOPMENT_TEAM' in line or 'CODE_SIGN_STYLE' in line:
+                      print(f"第{i}行: {line.strip()}")
+          PY
 
       # 编译签名IPA
       - name: Build IPA
