@@ -96,7 +96,9 @@ jobs:
         working-directory: ./source-code/enjoychinese_app/ios
         run: |
           python3 << 'PY'
+          import os
           team_id = "JU3D9VJFCN"
+          prov_profile_name = os.environ.get("PROV_RELEASE_NAME", "")
           path = "Runner.xcodeproj/project.pbxproj"
 
           with open(path, 'r') as f:
@@ -152,6 +154,8 @@ jobs:
                       insert_lines += '\n' + indent + 'DEVELOPMENT_TEAM = ' + team_id + ';'
                   if 'CODE_SIGN_STYLE' not in block:
                       insert_lines += '\n' + indent + 'CODE_SIGN_STYLE = Manual;'
+                  if prov_profile_name and 'PROVISIONING_PROFILE_SPECIFIER' not in block:
+                      insert_lines += '\n' + indent + 'PROVISIONING_PROFILE_SPECIFIER = "' + prov_profile_name + '";'
 
                   if insert_lines:
                       new_block = block[:bs_line_end] + insert_lines + block[bs_line_end:]
@@ -162,13 +166,15 @@ jobs:
           with open(path, 'w') as f:
               f.write(content)
 
-          print("已配置 DEVELOPMENT_TEAM 和 CODE_SIGN_STYLE")
+          print("已配置 DEVELOPMENT_TEAM、CODE_SIGN_STYLE 和 PROVISIONING_PROFILE_SPECIFIER")
           
           with open(path, 'r') as f:
               for i, line in enumerate(f, 1):
-                  if 'DEVELOPMENT_TEAM' in line or 'CODE_SIGN_STYLE' in line:
+                  if 'DEVELOPMENT_TEAM' in line or 'CODE_SIGN_STYLE' in line or 'PROVISIONING_PROFILE_SPECIFIER' in line:
                       print(f"第{i}行: {line.strip()}")
           PY
+        env:
+          PROV_RELEASE_NAME: ${{ secrets.PROV_RELEASE_NAME }}
 
       # 编译签名IPA（发布模式）
       - name: Build IPA
