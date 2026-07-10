@@ -61,6 +61,15 @@ jobs:
           p12-file-base64: ${{ secrets.P12_RELEASE_BASE64 }}
           p12-password: ${{ secrets.P12_RELEASE_PASSWORD }}
 
+      # 验证证书导入是否成功
+      - name: 验证证书
+        run: |
+          echo "=== 已安装的签名证书 ==="
+          security find-identity -v -p codesigning
+          echo ""
+          echo "=== 证书详细信息 ==="
+          security find-certificate -a -p /Users/runner/Library/Keychains/signing_temp.keychain-db | openssl x509 -text -noout 2>/dev/null | head -50
+
       # 导入发布Provisioning Profile到系统目录
       - name: 导入Provisioning Profile
         run: |
@@ -154,6 +163,8 @@ jobs:
                       insert_lines += '\n' + indent + 'DEVELOPMENT_TEAM = ' + team_id + ';'
                   if 'CODE_SIGN_STYLE' not in block:
                       insert_lines += '\n' + indent + 'CODE_SIGN_STYLE = Manual;'
+                  if 'CODE_SIGN_IDENTITY' not in block:
+                      insert_lines += '\n' + indent + 'CODE_SIGN_IDENTITY = "Apple Distribution";'
                   if prov_profile_name and 'PROVISIONING_PROFILE_SPECIFIER' not in block:
                       insert_lines += '\n' + indent + 'PROVISIONING_PROFILE_SPECIFIER = "' + prov_profile_name + '";'
 
