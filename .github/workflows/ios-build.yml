@@ -46,6 +46,21 @@ jobs:
         working-directory: ./source-code/enjoychinese_app
         run: flutter pub get
 
+      # 修复本地 video_player_android 插件缺少 messages.g.dart 的问题
+      # CI 环境中该文件未提交到源码，需从 pub.dev 缓存中复制
+      - name: Copy messages.g.dart for video_player_android
+        working-directory: ./source-code/enjoychinese_app
+        run: |
+          LOCAL_PLUGIN_DIR="local_plugins/video_player_android/lib/src"
+          PUB_CACHE_DIR=$(dirname $(find ~/.pub-cache/hosted/pub.dev -name "video_player_android-*" -type d | head -1))
+          if [ -n "$PUB_CACHE_DIR" ] && [ -f "$PUB_CACHE_DIR/video_player_android/lib/src/messages.g.dart" ]; then
+            cp "$PUB_CACHE_DIR/video_player_android/lib/src/messages.g.dart" "$LOCAL_PLUGIN_DIR/"
+            echo "已从 pub-cache 复制 messages.g.dart"
+          else
+            echo "警告: 未找到 video_player_android 的 pub-cache 目录"
+            ls -la ~/.pub-cache/hosted/pub.dev/ 2>/dev/null | head -20
+          fi
+
       # 安装CocoaPods，避免sudo权限问题
       - name: Install CocoaPods
         run: brew install cocoapods
@@ -54,20 +69,20 @@ jobs:
         working-directory: ./source-code/enjoychinese_app/ios
         run: pod install --repo-update
 
-      # 导入签名证书（只处理p12，provisioning profile单独处理）
+      # 导入签名证书（发布证书）
       - name: 导入iOS签名证书
         uses: apple-actions/import-codesign-certs@v2
         with:
-          p12-file-base64: ${{ secrets.P12_BASE64 }}
-          p12-password: ${{ secrets.P12_PASSWORD }}
+          p12-file-base64: ${{ secrets.P12_RELEASE_BASE64 }}
+          p12-password: ${{ secrets.P12_RELEASE_PASSWORD }}
 
-      # 导入Provisioning Profile到系统目录
+      # 导入发布Provisioning Profile到系统目录
       - name: 导入Provisioning Profile
         run: |
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-          echo "${{ secrets.PROV_BASE64 }}" | base64 -d > ~/Library/MobileDevice/Provisioning\ Profiles/671afe2a-a7e4-4b3e-80fc-1d83d57138d7.mobileprovision
+          echo "${{ secrets.PROV_RELEASE_BASE64 }}" | base64 -d > ~/Library/MobileDevice/Provisioning\ Profiles/prod_enjoychinese.mobileprovision
 
-      # 生成导出配置
+      # 生成导出配置（发布模式）
       - name: 生成ExportOptions.plist
         working-directory: ./source-code/enjoychinese_app/ios
         run: |
@@ -77,7 +92,7 @@ jobs:
           <plist version="1.0">
           <dict>
             <key>method</key>
-            <string>development</string>
+            <string>app-store</string>
             <key>teamID</key>
             <string>JU3D9VJFCN</string>
             <key>signingStyle</key>
@@ -85,7 +100,7 @@ jobs:
             <key>provisioningProfiles</key>
             <dict>
               <key>com.enjoychinese.app</key>
-              <string>iPhone7-test</string>
+              <string>${{ secrets.PROV_RELEASE_NAME }}</string>
             </dict>
           </dict>
           </plist>
