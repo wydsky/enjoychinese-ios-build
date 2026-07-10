@@ -46,21 +46,6 @@ jobs:
         working-directory: ./source-code/enjoychinese_app
         run: flutter pub get
 
-      # 修复本地 video_player_android 插件缺少 messages.g.dart 的问题
-      # CI 环境中该文件未提交到源码，需从 pub.dev 缓存中复制
-      - name: Copy messages.g.dart for video_player_android
-        working-directory: ./source-code/enjoychinese_app
-        run: |
-          LOCAL_PLUGIN_DIR="local_plugins/video_player_android/lib/src"
-          PUB_CACHE_DIR=$(dirname $(find ~/.pub-cache/hosted/pub.dev -name "video_player_android-*" -type d | head -1))
-          if [ -n "$PUB_CACHE_DIR" ] && [ -f "$PUB_CACHE_DIR/video_player_android/lib/src/messages.g.dart" ]; then
-            cp "$PUB_CACHE_DIR/video_player_android/lib/src/messages.g.dart" "$LOCAL_PLUGIN_DIR/"
-            echo "已从 pub-cache 复制 messages.g.dart"
-          else
-            echo "警告: 未找到 video_player_android 的 pub-cache 目录"
-            ls -la ~/.pub-cache/hosted/pub.dev/ 2>/dev/null | head -20
-          fi
-
       # 安装CocoaPods，避免sudo权限问题
       - name: Install CocoaPods
         run: brew install cocoapods
@@ -149,10 +134,6 @@ jobs:
                       start = content.find(search_str, block_end)
                       continue
 
-                  if 'DEVELOPMENT_TEAM' in block:
-                      start = content.find(search_str, block_end)
-                      continue
-
                   bs_pos = block.find('buildSettings = {')
                   if bs_pos == -1:
                       start = content.find(search_str, block_end)
@@ -166,10 +147,17 @@ jobs:
                   indent_len = len(line_before) - len(line_before.lstrip())
                   indent = '\t' * ((indent_len // 4) + 1) if '\t' in line_before else '    ' * ((indent_len // 4) + 1)
 
-                  new_block = block[:bs_line_end] + '\n' + indent + 'DEVELOPMENT_TEAM = ' + team_id + ';\n' + indent + 'CODE_SIGN_STYLE = Manual;' + block[bs_line_end:]
-                  content = content[:brace_start] + new_block + content[block_end:]
+                  insert_lines = ""
+                  if 'DEVELOPMENT_TEAM' not in block:
+                      insert_lines += '\n' + indent + 'DEVELOPMENT_TEAM = ' + team_id + ';'
+                  if 'CODE_SIGN_STYLE' not in block:
+                      insert_lines += '\n' + indent + 'CODE_SIGN_STYLE = Manual;'
 
-                  start = content.find(search_str, brace_start + len(new_block))
+                  if insert_lines:
+                      new_block = block[:bs_line_end] + insert_lines + block[bs_line_end:]
+                      content = content[:brace_start] + new_block + content[block_end:]
+
+                  start = content.find(search_str, brace_start + (len(new_block) if 'new_block' in locals() else len(block)))
 
           with open(path, 'w') as f:
               f.write(content)
@@ -182,13 +170,12 @@ jobs:
                       print(f"第{i}行: {line.strip()}")
           PY
 
-      # 编译签名IPA
+      # 编译签名IPA（发布模式）
       - name: Build IPA
         working-directory: ./source-code/enjoychinese_app
         run: |
           flutter build ipa \
             --release \
-            --no-codesign \
             --dart-define=ENV=prod \
             --dart-define=PROD_API_HOST=${{ secrets.PROD_API_HOST }} \
             --export-options-plist=ios/ExportOptions.plist
