@@ -67,20 +67,6 @@ jobs:
         working-directory: ./source-code/enjoychinese_app/ios
         run: pod install --repo-update
 
-      # 修复应用图标 alpha 通道问题（Apple 不允许图标有透明度）
-      - name: 修复 App Icon Alpha 通道
-        working-directory: ./source-code/enjoychinese_app/ios/Runner/Assets.xcassets/AppIcon.appiconset
-        run: |
-          echo "=== 检查并修复图标 Alpha 通道 ==="
-          for icon in *.png; do
-            if [ -f "$icon" ]; then
-              echo "处理: $icon"
-              sips -s format png "$icon" --out "$icon.tmp" --removeAlpha
-              mv "$icon.tmp" "$icon"
-              echo "  ✓ 已去除 alpha 通道"
-            fi
-          done
-
       # 导入签名证书（发布证书）
       - name: 导入iOS签名证书
         uses: apple-actions/import-codesign-certs@v2
