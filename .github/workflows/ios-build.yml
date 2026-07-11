@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-26
     steps:
       - name: Checkout 当前打包仓库
         uses: actions/checkout@v4
@@ -16,11 +16,10 @@ jobs:
       - name: Select Xcode
         run: |
           echo "=== 可用的 Xcode 版本 ==="
-          ls -la /Applications/Xcode*.app 2>/dev/null || echo "未找到 Xcode.app"
+          find /Applications -maxdepth 1 -type d -name "Xcode*.app" | sort -V
           echo ""
           
-          # 找到所有可用的 Xcode 版本并选择最高版本
-          AVAILABLE_XCODE=$(ls /Applications/Xcode*.app 2>/dev/null | sort -r | head -1)
+          AVAILABLE_XCODE=$(find /Applications -maxdepth 1 -type d -name "Xcode*.app" | sort -V | tail -1)
           if [ -n "$AVAILABLE_XCODE" ]; then
             echo "选择最新 Xcode: $AVAILABLE_XCODE"
             sudo xcode-select -s "$AVAILABLE_XCODE/Contents/Developer"
