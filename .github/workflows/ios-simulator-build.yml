@@ -62,25 +62,24 @@ jobs:
         working-directory: ./source-code/enjoychinese_app/ios
         run: pod install --repo-update
 
-      - name: 📱 确保有可用的iOS模拟器设备
+      - name: 📱 准备iOS模拟器（修复runner环境变化问题）
         run: |
-          SIMULATOR_UDID=$(xcrun simctl list devices available | grep -i "iPhone.*available" | head -1 | awk '{print $NF}' | tr -d '()')
-          
-          if [ -z "$SIMULATOR_UDID" ]; then
-            echo "未找到可用的iPhone模拟器，创建iPhone 15..."
-            SIMULATOR_UDID=$(xcrun simctl create "iPhone 15" com.apple.CoreSimulator.SimDeviceType.iPhone-15 $(xcrun simctl list runtimes | grep -i "iOS" | head -1 | awk '{print $NF}'))
-          fi
-          
-          echo "使用模拟器 UDID: $SIMULATOR_UDID"
-          
-          echo "启动模拟器..."
+          echo "=== 检查可用的iOS运行时 ==="
+          xcrun simctl list runtimes
+
+          echo ""
+          echo "=== 创建iPhone 15模拟器 ==="
+          xcrun simctl create "iPhone 15" com.apple.CoreSimulator.SimDeviceType.iPhone-15 $(xcrun simctl list runtimes | grep -i "iOS" | head -1 | awk '{print $NF}')
+
+          echo ""
+          echo "=== 启动模拟器 ==="
+          SIMULATOR_UDID=$(xcrun simctl list devices | grep "iPhone 15" | head -1 | awk '{print $NF}' | tr -d '()')
           xcrun simctl boot "$SIMULATOR_UDID"
-          sleep 3
-          
-          echo "验证模拟器状态..."
+          sleep 5
+
+          echo ""
+          echo "=== 验证模拟器状态 ==="
           xcrun simctl list devices | grep "iPhone 15"
-          
-          echo "SIMULATOR_UDID=$SIMULATOR_UDID" >> $GITHUB_ENV
 
       - name: 🔨 构建模拟器版本
         working-directory: ./source-code/enjoychinese_app
