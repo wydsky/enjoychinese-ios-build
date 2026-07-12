@@ -62,7 +62,7 @@ jobs:
         working-directory: ./source-code/enjoychinese_app/ios
         run: pod install --repo-update
 
-      - name: 📱 准备iOS模拟器（修复runner环境变化问题）
+      - name: 📱 准备iOS模拟器设备（无需启动，直接用UDID构建）
         run: |
           echo "=== 检查可用的iOS运行时 ==="
           xcrun simctl list runtimes
@@ -72,13 +72,13 @@ jobs:
           xcrun simctl create "iPhone 15" com.apple.CoreSimulator.SimDeviceType.iPhone-15 $(xcrun simctl list runtimes | grep -i "iOS" | head -1 | awk '{print $NF}')
 
           echo ""
-          echo "=== 启动模拟器 ==="
+          echo "=== 获取模拟器UDID ==="
           SIMULATOR_UDID=$(xcrun simctl list devices | grep "iPhone 15" | head -1 | awk '{print $NF}' | tr -d '()')
-          xcrun simctl boot "$SIMULATOR_UDID"
-          sleep 5
+          echo "SIMULATOR_UDID=$SIMULATOR_UDID" >> $GITHUB_ENV
+          echo "模拟器UDID: $SIMULATOR_UDID"
 
           echo ""
-          echo "=== 验证模拟器状态 ==="
+          echo "=== 验证设备存在 ==="
           xcrun simctl list devices | grep "iPhone 15"
 
       - name: 🔨 构建模拟器版本
@@ -87,8 +87,8 @@ jobs:
           echo "=== 开始构建模拟器版本 ==="
           flutter build ios \
             --debug \
-            --simulator \
             --no-codesign \
+            --device-id=$SIMULATOR_UDID \
             --dart-define=ENV=prod \
             --dart-define=PROD_API_HOST=https://app.enjoychinese.app
           echo ""
