@@ -1,19 +1,17 @@
-name: iOS Build & Sign
+name: iOS Release Build & Upload
 
 on:
-  workflow_dispatch: # 手动触发打包
-  push:
-    branches: [ master ]
+  workflow_dispatch:
 
 jobs:
-  build:
+  build-ipa:
     runs-on: macos-26
+    name: 生成IPA并上传至App Store Connect
     steps:
-      - name: Checkout 当前打包仓库
+      - name: 📋 Checkout 当前打包仓库
         uses: actions/checkout@v4
 
-      # 自动检测并选择最新可用的 Xcode 版本
-      - name: Select Xcode
+      - name: 🛠️ 自动检测并选择最新可用的 Xcode 版本
         run: |
           echo "=== 可用的 Xcode 版本 ==="
           find /Applications -maxdepth 1 -type d -name "Xcode*.app" | sort -V
@@ -31,21 +29,18 @@ jobs:
           echo "=== 当前 Xcode 版本 ==="
           xcodebuild -version
 
-      # 拉取私有Gitee Flutter代码，账号token从Secrets读取
-      - name: Clone Gitee 源码
+      - name: 📥 拉取私有Gitee Flutter代码
         run: |
           git clone https://oauth2:${{ secrets.GITEE_TOKEN }}@gitee.com/yunhaninfo/enjoy-chinese.git source-code
           cd source-code
 
-      # 配置Flutter
-      - name: Setup Flutter
+      - name: 🚀 配置 Flutter
         uses: subosito/flutter-action@v2
         with:
           flutter-version: '3.44.2'
           channel: stable
 
-      # 缓存依赖，加快打包速度
-      - name: Cache Flutter & Pods
+      - name: 💾 缓存依赖
         uses: actions/cache@v4
         with:
           path: |
@@ -54,28 +49,24 @@ jobs:
             ./source-code/enjoychinese_app/ios/Pods
           key: ${{ runner.os }}-flutter-${{ hashFiles('source-code/enjoychinese_app/pubspec.lock') }}
 
-      # 安装项目依赖
-      - name: Flutter pub get
+      - name: 📦 安装项目依赖
         working-directory: ./source-code/enjoychinese_app
         run: flutter pub get
 
-      # 安装CocoaPods，避免sudo权限问题
-      - name: Install CocoaPods
+      - name: 📦 安装 CocoaPods
         run: brew install cocoapods
 
-      - name: Pod install
+      - name: 📦 Pod install
         working-directory: ./source-code/enjoychinese_app/ios
         run: pod install --repo-update
 
-      # 导入签名证书（发布证书）
-      - name: 导入iOS签名证书
+      - name: 🔑 导入iOS签名证书（发布证书）
         uses: apple-actions/import-codesign-certs@v2
         with:
           p12-file-base64: ${{ secrets.P12_RELEASE_BASE64 }}
           p12-password: ${{ secrets.P12_RELEASE_PASSWORD }}
 
-      # 验证证书导入是否成功
-      - name: 验证证书
+      - name: ✅ 验证证书导入是否成功
         run: |
           echo "=== 已安装的签名证书 ==="
           security find-identity -v -p codesigning
@@ -83,14 +74,12 @@ jobs:
           echo "=== 证书详细信息 ==="
           security find-certificate -a -p /Users/runner/Library/Keychains/signing_temp.keychain-db | openssl x509 -text -noout 2>/dev/null | head -50
 
-      # 导入发布Provisioning Profile到系统目录
-      - name: 导入Provisioning Profile
+      - name: 📄 导入发布Provisioning Profile
         run: |
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
           echo "${{ secrets.PROV_RELEASE_BASE64 }}" | base64 -d > ~/Library/MobileDevice/Provisioning\ Profiles/prod_enjoychinese.mobileprovision
 
-      # 生成导出配置（发布模式）
-      - name: 生成ExportOptions.plist
+      - name: 📝 生成导出配置（发布模式）
         working-directory: ./source-code/enjoychinese_app/ios
         run: |
           cat > ExportOptions.plist <<EOF
@@ -113,8 +102,7 @@ jobs:
           </plist>
           EOF
 
-      # 配置Xcode项目的Development Team和签名方式（解决Runner Release配置缺少DEVELOPMENT_TEAM问题）
-      - name: 配置Xcode Team ID
+      - name: 🛠️ 配置Xcode项目的Team ID和签名方式
         working-directory: ./source-code/enjoychinese_app/ios
         run: |
           python3 << 'PY'
@@ -127,9 +115,9 @@ jobs:
               content = f.read()
 
           runner_config_ids = [
-              "97C147061CF9000F007C117D",  # Debug
-              "97C147071CF9000F007C117D",  # Release
-              "249021D4217E4FDB00AE95B9",   # Profile
+              "97C147061CF9000F007C117D",
+              "97C147071CF9000F007C117D",
+              "249021D4217E4FDB00AE95B9",
           ]
 
           def find_block_end(text, start):
@@ -200,18 +188,19 @@ jobs:
         env:
           PROV_RELEASE_NAME: ${{ secrets.PROV_RELEASE_NAME }}
 
-      # 编译签名IPA（发布模式）
-      - name: Build IPA
+      - name: 🔨 编译签名IPA（发布模式）
         working-directory: ./source-code/enjoychinese_app
         run: |
+          echo "=== 开始构建 IPA ==="
           flutter build ipa \
             --release \
             --dart-define=ENV=prod \
             --dart-define=PROD_API_HOST=${{ secrets.PROD_API_HOST }} \
             --export-options-plist=ios/ExportOptions.plist
+          echo ""
+          echo "=== IPA 构建完成 ==="
 
-      # 验证步骤1：检查 IPA 文件存在
-      - name: 检查 IPA 文件
+      - name: ✅ 验证步骤1：检查 IPA 文件存在
         working-directory: ./source-code/enjoychinese_app
         run: |
           echo "=== IPA 文件列表 ==="
@@ -220,8 +209,7 @@ jobs:
           echo "=== 文件大小 ==="
           du -h build/ios/ipa/*.ipa
 
-      # 验证步骤2：解压并检查签名
-      - name: 验证代码签名
+      - name: ✅ 验证步骤2：解压并检查签名
         working-directory: ./source-code/enjoychinese_app
         run: |
           unzip -q build/ios/ipa/*.ipa -d build/ios/ipa_content
@@ -231,8 +219,7 @@ jobs:
           echo "=== 签名验证 ==="
           codesign --verify --deep --strict build/ios/ipa_content/Payload/Runner.app 2>&1 || echo "签名验证失败"
 
-      # 验证步骤3：使用 altool 验证 App Store 兼容性
-      - name: App Store 验证
+      - name: ✅ 验证步骤3：使用 altool 验证 App Store 兼容性
         working-directory: ./source-code/enjoychinese_app
         run: |
           IPA_PATH=$(find build/ios/ipa -name "*.ipa" -type f | head -1)
@@ -243,9 +230,34 @@ jobs:
             --username "${{ secrets.APPLE_ID }}" \
             --password "${{ secrets.APP_STORE_CONNECT_PASSWORD }}"
 
-      # 上传打包产物，可下载
-      - name: 上传IPA安装包
+      - name: 📤 上传到 App Store Connect / TestFlight
+        working-directory: ./source-code/enjoychinese_app
+        run: |
+          IPA_PATH=$(find build/ios/ipa -name "*.ipa" -type f | head -1)
+          echo "上传 IPA: $IPA_PATH"
+          xcrun altool --upload-app \
+            --file "$IPA_PATH" \
+            --type ios \
+            --username "${{ secrets.APPLE_ID }}" \
+            --password "${{ secrets.APP_STORE_CONNECT_PASSWORD }}"
+
+      - name: 📦 上传IPA安装包（供下载）
         uses: actions/upload-artifact@v4
         with:
           name: enjoychinese-prod-ipa
           path: ./source-code/enjoychinese_app/build/ios/ipa/*.ipa
+
+      - name: 📊 构建结果报告
+        run: |
+          echo "========================================"
+          echo "🎉 iOS Release Build 完成"
+          echo "========================================"
+          echo "状态: ✅ 成功"
+          echo "Runner: ${{ runner.os }}"
+          echo "Xcode: $(xcodebuild -version | head -1)"
+          echo "Flutter: $(flutter --version | head -1)"
+          echo "========================================"
+          echo "IPA 已上传至 App Store Connect"
+          echo "请前往 App Store Connect 管理测试和审核"
+          echo "https://appstoreconnect.apple.com/"
+          echo "========================================"
