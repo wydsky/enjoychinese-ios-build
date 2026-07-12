@@ -73,7 +73,7 @@ jobs:
 
           echo ""
           echo "=== 获取模拟器UDID ==="
-          SIMULATOR_UDID=$(xcrun simctl list devices | grep "iPhone 15" | head -1 | awk '{print $NF}' | tr -d '()')
+          SIMULATOR_UDID=$(xcrun simctl list devices | grep "iPhone 15" | head -1 | awk '{print $3}' | tr -d '()')
           echo "SIMULATOR_UDID=$SIMULATOR_UDID" >> $GITHUB_ENV
           echo "模拟器UDID: $SIMULATOR_UDID"
 
