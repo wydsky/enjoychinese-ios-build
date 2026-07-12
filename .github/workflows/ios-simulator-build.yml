@@ -73,10 +73,7 @@ jobs:
       - name: ✅ 验证构建产物
         working-directory: ./source-code/enjoychinese_app
         run: |
-          APP_PATH=$(find build/ios/iphoneos -name "Runner.app" -type d | head -1)
-          if [ -z "$APP_PATH" ]; then
-            APP_PATH=$(find build/ios -name "Runner.app" -type d | head -1)
-          fi
+          APP_PATH=$(find build/ios -name "Runner.app" -type d | head -1)
           
           if [ -d "$APP_PATH" ]; then
             echo "✅ 构建成功！"
