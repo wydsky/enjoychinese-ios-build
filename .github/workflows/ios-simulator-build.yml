@@ -62,6 +62,16 @@ jobs:
         working-directory: ./source-code/enjoychinese_app/ios
         run: pod install --repo-update
 
+      - name: 📱 确保有可用的iOS模拟器设备
+        run: |
+          if ! xcrun simctl list devices available | grep -qE "iPhone.*available"; then
+            echo "未找到可用的iPhone模拟器，创建iPhone 15..."
+            xcrun simctl create "iPhone 15" com.apple.CoreSimulator.SimDeviceType.iPhone-15 $(xcrun simctl list runtimes | grep -i "iOS" | head -1 | awk '{print $NF}') 2>/dev/null || \
+            echo "警告: 创建模拟器失败，将尝试使用默认目标"
+          else
+            echo "检测到已有可用iPhone模拟器"
+          fi
+
       - name: 🔨 构建模拟器版本
         working-directory: ./source-code/enjoychinese_app
         run: |
