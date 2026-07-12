@@ -64,13 +64,23 @@ jobs:
 
       - name: 📱 确保有可用的iOS模拟器设备
         run: |
-          if ! xcrun simctl list devices available | grep -qE "iPhone.*available"; then
+          SIMULATOR_UDID=$(xcrun simctl list devices available | grep -i "iPhone.*available" | head -1 | awk '{print $NF}' | tr -d '()')
+          
+          if [ -z "$SIMULATOR_UDID" ]; then
             echo "未找到可用的iPhone模拟器，创建iPhone 15..."
-            xcrun simctl create "iPhone 15" com.apple.CoreSimulator.SimDeviceType.iPhone-15 $(xcrun simctl list runtimes | grep -i "iOS" | head -1 | awk '{print $NF}') 2>/dev/null || \
-            echo "警告: 创建模拟器失败，将尝试使用默认目标"
-          else
-            echo "检测到已有可用iPhone模拟器"
+            SIMULATOR_UDID=$(xcrun simctl create "iPhone 15" com.apple.CoreSimulator.SimDeviceType.iPhone-15 $(xcrun simctl list runtimes | grep -i "iOS" | head -1 | awk '{print $NF}'))
           fi
+          
+          echo "使用模拟器 UDID: $SIMULATOR_UDID"
+          
+          echo "启动模拟器..."
+          xcrun simctl boot "$SIMULATOR_UDID"
+          sleep 3
+          
+          echo "验证模拟器状态..."
+          xcrun simctl list devices | grep "iPhone 15"
+          
+          echo "SIMULATOR_UDID=$SIMULATOR_UDID" >> $GITHUB_ENV
 
       - name: 🔨 构建模拟器版本
         working-directory: ./source-code/enjoychinese_app
