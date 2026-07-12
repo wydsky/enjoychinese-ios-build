@@ -86,10 +86,11 @@ jobs:
         working-directory: ./source-code/enjoychinese_app
         run: |
           echo "=== 开始构建模拟器版本 ==="
+          echo "使用模拟器UDID: $SIMULATOR_UDID"
           flutter build ios \
             --debug \
-            --simulator \
             --no-codesign \
+            --device-id=$SIMULATOR_UDID \
             --dart-define=ENV=prod \
             --dart-define=PROD_API_HOST=https://app.enjoychinese.app
           echo ""
