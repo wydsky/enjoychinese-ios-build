@@ -115,6 +115,9 @@ jobs:
               content = f.read()
 
           runner_config_ids = [
+              "97C147031CF9000F007C117D",
+              "97C147041CF9000F007C117D",
+              "249021D3217E4FDB00AE95B9",
               "97C147061CF9000F007C117D",
               "97C147071CF9000F007C117D",
               "249021D4217E4FDB00AE95B9",
@@ -129,6 +132,7 @@ jobs:
                   elif text[i] == '}':
                       depth -= 1
                   i += 1
+                  
               return i
 
           for config_id in runner_config_ids:
