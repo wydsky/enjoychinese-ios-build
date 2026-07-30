@@ -28,7 +28,7 @@ jobs:
 
       - name: 📥 Pull private Gitee Flutter code
         run: |
-          git clone -b main https://oauth2:${{ secrets.GITEE_TOKEN }}@gitee.com/yunhaninfo/enjoy-chinese.git source-code
+          git clone -b client-test https://oauth2:${{ secrets.GITEE_TOKEN }}@gitee.com/yunhaninfo/enjoy-chinese.git source-code
           cd source-code
 
       - name: 🚀 Setup Flutter

@@ -31,7 +31,7 @@ jobs:
 
       - name: 📥 拉取私有Gitee Flutter代码
         run: |
-          git clone -b main https://oauth2:${{ secrets.GITEE_TOKEN }}@gitee.com/yunhaninfo/enjoy-chinese.git source-code
+          git clone -b client-test https://oauth2:${{ secrets.GITEE_TOKEN }}@gitee.com/yunhaninfo/enjoy-chinese.git source-code
           cd source-code
 
       - name: 🚀 配置 Flutter
