@@ -72,7 +72,8 @@ jobs:
         working-directory: ./source-code/enjoychinese_app/android
         run: |
           cat > key.properties <<EOF
-          storeFile=./app/keys/enjoychinese-release.jks
+          # build.gradle.kts 位于 android/app，file() 从 android/app 目录解析路径
+          storeFile=./keys/enjoychinese-release.jks
           storePassword=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}
           keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}
