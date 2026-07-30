@@ -1,0 +1,119 @@
+name: iOS Simulator Build
+
+on:
+  push:
+    branches: [ master ]
+  workflow_dispatch:
+
+jobs:
+  build-simulator:
+    runs-on: macos-26
+    name: 生成模拟器.app
+    steps:
+      - name: 📋 Checkout 当前打包仓库
+        uses: actions/checkout@v4
+
+      - name: 🛠️ 自动检测并选择最新可用的 Xcode 版本
+        run: |
+          echo "=== 可用的 Xcode 版本 ==="
+          find /Applications -maxdepth 1 -type d -name "Xcode*.app" | sort -V
+          echo ""
+          
+          AVAILABLE_XCODE=$(find /Applications -maxdepth 1 -type d -name "Xcode*.app" | sort -V | tail -1)
+          if [ -n "$AVAILABLE_XCODE" ]; then
+            echo "选择最新 Xcode: $AVAILABLE_XCODE"
+            sudo xcode-select -s "$AVAILABLE_XCODE/Contents/Developer"
+          else
+            echo "警告: 未找到 Xcode，使用默认配置"
+          fi
+          
+          echo ""
+          echo "=== 当前 Xcode 版本 ==="
+          xcodebuild -version
+
+      - name: 📥 拉取私有Gitee Flutter代码
+        run: |
+          git clone -b main https://oauth2:${{ secrets.GITEE_TOKEN }}@gitee.com/yunhaninfo/enjoy-chinese.git source-code
+          cd source-code
+
+      - name: 🚀 配置 Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.2'
+          channel: stable
+
+      - name: 💾 缓存依赖
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            ./source-code/enjoychinese_app/.dart_tool
+            ./source-code/enjoychinese_app/ios/Pods
+          key: ${{ runner.os }}-flutter-${{ hashFiles('source-code/enjoychinese_app/pubspec.lock') }}
+
+      - name: 📦 安装项目依赖
+        working-directory: ./source-code/enjoychinese_app
+        run: flutter pub get
+
+      - name: 📦 安装 CocoaPods
+        run: brew install cocoapods
+
+      - name: 📦 Pod install
+        working-directory: ./source-code/enjoychinese_app/ios
+        run: pod install --repo-update
+
+      - name: 🔨 构建模拟器版本（测试环境）
+        working-directory: ./source-code/enjoychinese_app
+        run: |
+          echo "=== 开始构建测试环境模拟器版本 ==="
+          flutter build ios \
+            --debug \
+            --simulator \
+            --no-codesign \
+            --dart-define=ENV=test \
+            --dart-define=TEST_API_HOST=http://test.enjoychinese.app \
+            --dart-define=REVENUECAT_API_KEY=test_MlbQVInvEybRiQQBFLJmDkQJUmC
+          echo ""
+          echo "=== 构建完成 ==="
+
+      - name: ✅ 验证构建产物
+        working-directory: ./source-code/enjoychinese_app
+        run: |
+          APP_PATH=$(find build/ios -name "Runner.app" -type d | head -1)
+          
+          if [ -d "$APP_PATH" ]; then
+            echo "✅ 构建成功！"
+            echo "产物路径: $APP_PATH"
+            echo "文件大小: $(du -sh "$APP_PATH")"
+            echo ""
+            echo "=== 文件列表 ==="
+            ls -la "$APP_PATH" | head -20
+          else
+            echo "❌ 构建失败：未找到 Runner.app"
+            exit 1
+          fi
+
+      - name: 📤 上传模拟器构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: enjoychinese-simulator-app
+          path: |
+            ./source-code/enjoychinese_app/build/ios/**/*.app
+          if-no-files-found: error
+
+      - name: 📊 构建结果报告
+        run: |
+          echo "========================================"
+          echo "🎉 iOS Simulator Test Build 完成"
+          echo "========================================"
+          echo "状态: ✅ 成功"
+          echo "Runner: ${{ runner.os }}"
+          echo "Xcode: $(xcodebuild -version | head -1)"
+          echo "Flutter: $(flutter --version | head -1)"
+          echo "========================================"
+          echo "下一步：下载 enjoychinese-simulator-app 产物"
+          echo "在本地 iOS 模拟器中进行测试验证"
+          echo "测试通过后手动触发 iOS Test Build"
+          echo "========================================"
+
+          

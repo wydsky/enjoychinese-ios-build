@@ -1,0 +1,268 @@
+name: iOS Test Build & Upload
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-ipa:
+    runs-on: macos-26
+    name: 生成IPA并上传至App Store Connect
+    steps:
+      - name: 📋 Checkout 当前打包仓库
+        uses: actions/checkout@v4
+
+      - name: 🛠️ 自动检测并选择最新可用的 Xcode 版本
+        run: |
+          echo "=== 可用的 Xcode 版本 ==="
+          find /Applications -maxdepth 1 -type d -name "Xcode*.app" | sort -V
+          echo ""
+          
+          AVAILABLE_XCODE=$(find /Applications -maxdepth 1 -type d -name "Xcode*.app" | sort -V | tail -1)
+          if [ -n "$AVAILABLE_XCODE" ]; then
+            echo "选择最新 Xcode: $AVAILABLE_XCODE"
+            sudo xcode-select -s "$AVAILABLE_XCODE/Contents/Developer"
+          else
+            echo "警告: 未找到 Xcode，使用默认配置"
+          fi
+          
+          echo ""
+          echo "=== 当前 Xcode 版本 ==="
+          xcodebuild -version
+
+      - name: 📥 拉取私有Gitee Flutter代码
+        run: |
+          git clone -b main https://oauth2:${{ secrets.GITEE_TOKEN }}@gitee.com/yunhaninfo/enjoy-chinese.git source-code
+          cd source-code
+
+      - name: 🚀 配置 Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.2'
+          channel: stable
+
+      - name: 💾 缓存依赖
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            ./source-code/enjoychinese_app/.dart_tool
+            ./source-code/enjoychinese_app/ios/Pods
+          key: ${{ runner.os }}-flutter-${{ hashFiles('source-code/enjoychinese_app/pubspec.lock') }}
+
+      - name: 📦 安装项目依赖
+        working-directory: ./source-code/enjoychinese_app
+        run: flutter pub get
+
+      - name: 📦 安装 CocoaPods
+        run: brew install cocoapods
+
+      - name: 📦 Pod install
+        working-directory: ./source-code/enjoychinese_app/ios
+        run: pod install --repo-update
+
+      - name: 🔑 导入iOS签名证书（发布证书）
+        uses: apple-actions/import-codesign-certs@v2
+        with:
+          p12-file-base64: ${{ secrets.P12_RELEASE_BASE64 }}
+          p12-password: ${{ secrets.P12_RELEASE_PASSWORD }}
+
+      - name: ✅ 验证证书导入是否成功
+        run: |
+          echo "=== 已安装的签名证书 ==="
+          security find-identity -v -p codesigning
+          echo ""
+          echo "=== 证书详细信息 ==="
+          security find-certificate -a -p /Users/runner/Library/Keychains/signing_temp.keychain-db | openssl x509 -text -noout 2>/dev/null | head -50
+
+      - name: 📄 导入发布Provisioning Profile
+        run: |
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          echo "${{ secrets.PROV_RELEASE_BASE64 }}" | base64 -d > ~/Library/MobileDevice/Provisioning\ Profiles/prod_enjoychinese.mobileprovision
+
+      - name: 📝 生成导出配置（发布模式）
+        working-directory: ./source-code/enjoychinese_app/ios
+        run: |
+          cat > ExportOptions.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>app-store</string>
+            <key>teamID</key>
+            <string>JU3D9VJFCN</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>com.enjoychinese.app</key>
+              <string>${{ secrets.PROV_RELEASE_NAME }}</string>
+            </dict>
+          </dict>
+          </plist>
+          EOF
+
+      - name: 🛠️ 配置Xcode项目的Team ID和签名方式
+        working-directory: ./source-code/enjoychinese_app/ios
+        run: |
+          python3 << 'PY'
+          import os
+          team_id = "JU3D9VJFCN"
+          prov_profile_name = os.environ.get("PROV_RELEASE_NAME", "")
+          path = "Runner.xcodeproj/project.pbxproj"
+
+          with open(path, 'r') as f:
+              content = f.read()
+
+          runner_config_ids = [
+              "97C147031CF9000F007C117D",
+              "97C147041CF9000F007C117D",
+              "249021D3217E4FDB00AE95B9",
+              "97C147061CF9000F007C117D",
+              "97C147071CF9000F007C117D",
+              "249021D4217E4FDB00AE95B9",
+          ]
+
+          def find_block_end(text, start):
+              depth = 1
+              i = start
+              while i < len(text) and depth > 0:
+                  if text[i] == '{':
+                      depth += 1
+                  elif text[i] == '}':
+                      depth -= 1
+                  i += 1
+                  
+              return i
+
+          for config_id in runner_config_ids:
+              search_str = config_id + " /* "
+              start = content.find(search_str)
+              while start != -1:
+                  brace_start = content.find('{', start)
+                  if brace_start == -1:
+                      break
+
+                  block_end = find_block_end(content, brace_start + 1)
+                  block = content[brace_start:block_end]
+
+                  if 'RunnerTests' in block:
+                      start = content.find(search_str, block_end)
+                      continue
+
+                  bs_pos = block.find('buildSettings = {')
+                  if bs_pos == -1:
+                      start = content.find(search_str, block_end)
+                      continue
+
+                  bs_line_end = block.find('\n', bs_pos)
+                  if bs_line_end == -1:
+                      bs_line_end = bs_pos + len('buildSettings = {')
+
+                  line_before = block[:bs_line_end]
+                  indent_len = len(line_before) - len(line_before.lstrip())
+                  indent = '\t' * ((indent_len // 4) + 1) if '\t' in line_before else '    ' * ((indent_len // 4) + 1)
+
+                  insert_lines = ""
+                  if 'DEVELOPMENT_TEAM' not in block:
+                      insert_lines += '\n' + indent + 'DEVELOPMENT_TEAM = ' + team_id + ';'
+                  if 'CODE_SIGN_STYLE' not in block:
+                      insert_lines += '\n' + indent + 'CODE_SIGN_STYLE = Manual;'
+                  if 'CODE_SIGN_IDENTITY' not in block:
+                      insert_lines += '\n' + indent + 'CODE_SIGN_IDENTITY = "Apple Distribution";'
+                  if prov_profile_name and 'PROVISIONING_PROFILE_SPECIFIER' not in block:
+                      insert_lines += '\n' + indent + 'PROVISIONING_PROFILE_SPECIFIER = "' + prov_profile_name + '";'
+
+                  if insert_lines:
+                      new_block = block[:bs_line_end] + insert_lines + block[bs_line_end:]
+                      content = content[:brace_start] + new_block + content[block_end:]
+
+                  start = content.find(search_str, brace_start + (len(new_block) if 'new_block' in locals() else len(block)))
+
+          with open(path, 'w') as f:
+              f.write(content)
+
+          print("已配置 DEVELOPMENT_TEAM、CODE_SIGN_STYLE 和 PROVISIONING_PROFILE_SPECIFIER")
+          
+          with open(path, 'r') as f:
+              for i, line in enumerate(f, 1):
+                  if 'DEVELOPMENT_TEAM' in line or 'CODE_SIGN_STYLE' in line or 'PROVISIONING_PROFILE_SPECIFIER' in line:
+                      print(f"第{i}行: {line.strip()}")
+          PY
+        env:
+          PROV_RELEASE_NAME: ${{ secrets.PROV_RELEASE_NAME }}
+
+      - name: 🔨 编译签名IPA（测试模式）
+        working-directory: ./source-code/enjoychinese_app
+        run: |
+          echo "=== 开始构建测试环境 IPA ==="
+          flutter build ipa \
+            --release \
+            --dart-define=ENV=test \
+            --dart-define=TEST_API_HOST=http://test.enjoychinese.app \
+            --dart-define=REVENUECAT_API_KEY=test_MlbQVInvEybRiQQBFLJmDkQJUmC \
+            --export-options-plist=ios/ExportOptions.plist
+          echo ""
+          echo "=== IPA 构建完成 ==="
+
+      - name: ✅ 验证步骤1：检查 IPA 文件存在
+        working-directory: ./source-code/enjoychinese_app
+        run: |
+          echo "=== IPA 文件列表 ==="
+          ls -la build/ios/ipa/
+          echo ""
+          echo "=== 文件大小 ==="
+          du -h build/ios/ipa/*.ipa
+
+      - name: ✅ 验证步骤2：解压并检查签名
+        working-directory: ./source-code/enjoychinese_app
+        run: |
+          unzip -q build/ios/ipa/*.ipa -d build/ios/ipa_content
+          echo "=== 签名信息 ==="
+          codesign -dv --verbose=4 build/ios/ipa_content/Payload/Runner.app 2>&1 | head -30
+          echo ""
+          echo "=== 签名验证 ==="
+          codesign --verify --deep --strict build/ios/ipa_content/Payload/Runner.app 2>&1 || echo "签名验证失败"
+
+      - name: ✅ 验证步骤3：使用 altool 验证 App Store 兼容性
+        working-directory: ./source-code/enjoychinese_app
+        run: |
+          IPA_PATH=$(find build/ios/ipa -name "*.ipa" -type f | head -1)
+          echo "验证 IPA: $IPA_PATH"
+          xcrun altool --validate-app \
+            --file "$IPA_PATH" \
+            --type ios \
+            --username "${{ secrets.APPLE_ID }}" \
+            --password "${{ secrets.APP_STORE_CONNECT_PASSWORD }}"
+
+      - name: 📤 上传到 App Store Connect / TestFlight
+        working-directory: ./source-code/enjoychinese_app
+        run: |
+          IPA_PATH=$(find build/ios/ipa -name "*.ipa" -type f | head -1)
+          echo "上传 IPA: $IPA_PATH"
+          xcrun altool --upload-app \
+            --file "$IPA_PATH" \
+            --type ios \
+            --username "${{ secrets.APPLE_ID }}" \
+            --password "${{ secrets.APP_STORE_CONNECT_PASSWORD }}"
+
+      - name: 📦 上传IPA安装包（供下载）
+        uses: actions/upload-artifact@v4
+        with:
+          name: enjoychinese-prod-ipa
+          path: ./source-code/enjoychinese_app/build/ios/ipa/*.ipa
+
+      - name: 📊 构建结果报告
+        run: |
+          echo "========================================"
+          echo "🎉 iOS Test Build 完成"
+          echo "========================================"
+          echo "状态: ✅ 成功"
+          echo "Runner: ${{ runner.os }}"
+          echo "Xcode: $(xcodebuild -version | head -1)"
+          echo "Flutter: $(flutter --version | head -1)"
+          echo "========================================"
+          echo "IPA 已上传至 App Store Connect"
+          echo "请前往 App Store Connect 管理测试和审核"
+          echo "https://appstoreconnect.apple.com/"
+          echo "========================================"

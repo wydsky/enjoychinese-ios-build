@@ -1,0 +1,204 @@
+name: Android Test Build & Google Play Upload
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_notes:
+        description: 'Release notes for this build'
+        required: true
+        default: 'Bug fixes and performance improvements'
+      track:
+        description: 'Google Play track to upload to'
+        required: true
+        default: 'internal'
+        type: choice
+        options:
+          - internal
+          - alpha
+          - beta
+          - production
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    name: Build Android APK & Upload to Google Play
+    steps:
+      - name: 📋 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 📥 Pull private Gitee Flutter code
+        run: |
+          git clone -b main https://oauth2:${{ secrets.GITEE_TOKEN }}@gitee.com/yunhaninfo/enjoy-chinese.git source-code
+          cd source-code
+
+      - name: 🚀 Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.2'
+          channel: stable
+
+      - name: 💾 Cache Flutter dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            ./source-code/enjoychinese_app/.dart_tool
+          key: ${{ runner.os }}-flutter-${{ hashFiles('source-code/enjoychinese_app/pubspec.lock') }}
+
+      - name: 📦 Install Flutter dependencies
+        working-directory: ./source-code/enjoychinese_app
+        run: flutter pub get
+
+      - name: 🛠️ Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: 🛠️ Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          api-level: 35
+          build-tools: 35.0.0
+          ndk: 26.1.10909125
+
+      - name: 🔑 Decode keystore file
+        run: |
+          mkdir -p ./source-code/enjoychinese_app/android/app/keys
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > ./source-code/enjoychinese_app/android/app/keys/enjoychinese-release.jks
+
+      - name: 📝 Generate key.properties
+        working-directory: ./source-code/enjoychinese_app/android
+        run: |
+          cat > key.properties <<EOF
+          storeFile=./app/keys/enjoychinese-release.jks
+          storePassword=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}
+          keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}
+          EOF
+
+      - name: 🔨 Build AAB (Release)
+        working-directory: ./source-code/enjoychinese_app
+        run: |
+          echo "=== Starting Android Test Build ==="
+          flutter build appbundle \
+            --release \
+            --dart-define=ENV=test \
+            --dart-define=TEST_API_HOST=http://test.enjoychinese.app \
+            --dart-define=REVENUECAT_API_KEY=test_MlbQVInvEybRiQQBFLJmDkQJUmC
+          echo ""
+          echo "=== Build Completed ==="
+
+      - name: ✅ Verify AAB exists
+        working-directory: ./source-code/enjoychinese_app
+        run: |
+          echo "=== AAB File List ==="
+          ls -la build/app/outputs/bundle/release/
+          echo ""
+          echo "=== File Size ==="
+          du -h build/app/outputs/bundle/release/*.aab
+          echo ""
+          
+          AAB_PATH=$(find build/app/outputs/bundle/release -name "app-release.aab" -type f)
+          if [ -f "$AAB_PATH" ]; then
+            echo "✅ AAB found: $AAB_PATH"
+          else
+            echo "❌ AAB not found!"
+            exit 1
+          fi
+
+      - name: 📦 Upload AAB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: enjoychinese-prod-aab
+          path: ./source-code/enjoychinese_app/build/app/outputs/bundle/release/*.aab
+          if-no-files-found: error
+
+      - name: 🔑 Decode Google Play Service Account Key
+        run: |
+          echo "${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_KEY_BASE64 }}" | base64 -d > /tmp/google-play-key.json
+
+      - name: 📤 Upload to Google Play
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJson: /tmp/google-play-key.json
+          packageName: com.enjoychinese.app
+          releaseFiles: ./source-code/enjoychinese_app/build/app/outputs/bundle/release/app-release.aab
+          track: ${{ github.event.inputs.track }}
+          releaseNotes: |
+            ${{ github.event.inputs.release_notes }}
+            
+            Build Info:
+            - Commit: ${{ github.sha }}
+            - Branch: ${{ github.ref_name }}
+            - Build: ${{ github.run_id }}
+          status: completed
+
+      - name: 🧹 Cleanup sensitive files
+        if: always()
+        run: |
+          rm -f ./source-code/enjoychinese_app/android/key.properties
+          rm -f ./source-code/enjoychinese_app/android/app/keys/enjoychinese-release.jks
+          rm -f /tmp/google-play-key.json
+          echo "✅ Cleanup completed"
+
+      - name: 📊 Build Result Report
+        run: |
+          echo "========================================"
+          echo "🎉 Android Test Build Complete"
+          echo "========================================"
+          echo "Status: ✅ Success"
+          echo "Runner: ${{ runner.os }}"
+          echo "Flutter: $(flutter --version | head -1)"
+          echo "Java: $(java -version 2>&1 | head -1)"
+          echo "Track: ${{ github.event.inputs.track }}"
+          echo "========================================"
+          echo "APK uploaded to Google Play"
+          echo "Release Notes: ${{ github.event.inputs.release_notes }}"
+          echo "========================================"
+          echo "Next Steps:"
+          echo "1. Verify build in Google Play Console"
+          echo "2. Promote to desired track"
+          echo "3. Monitor rollout progress"
+          echo "========================================"
+
+  notify:
+    needs: build-apk
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify success
+        if: needs.build-apk.result == 'success'
+        uses: timonwong/notify-msg-action@v1
+        with:
+          type: wechat_work
+          corpid: ${{ secrets.WECHAT_WORK_CORPID }}
+          corpsecret: ${{ secrets.WECHAT_WORK_CORPSECRET }}
+          agentid: ${{ secrets.WECHAT_WORK_AGENTID }}
+          message: |
+            ✅ Android Build Succeeded
+
+            **Track:** ${{ github.event.inputs.track }}
+            **Commit:** ${{ github.sha }}
+            **Branch:** ${{ github.ref_name }}
+            **Release Notes:** ${{ github.event.inputs.release_notes }}
+
+            View: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Notify failure
+        if: needs.build-apk.result == 'failure'
+        uses: timonwong/notify-msg-action@v1
+        with:
+          type: wechat_work
+          corpid: ${{ secrets.WECHAT_WORK_CORPID }}
+          corpsecret: ${{ secrets.WECHAT_WORK_CORPSECRET }}
+          agentid: ${{ secrets.WECHAT_WORK_AGENTID }}
+          message: |
+            ❌ Android Build FAILED
+
+            **Track:** ${{ github.event.inputs.track }}
+            **Commit:** ${{ github.sha }}
+            **Branch:** ${{ github.ref_name }}
+
+            Check: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
