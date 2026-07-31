@@ -125,14 +125,7 @@ jobs:
           serviceAccountJson: /tmp/google-play-key.json
           packageName: com.enjoychinese.app
           releaseFiles: ./source-code/enjoychinese_app/build/app/outputs/bundle/release/app-release.aab
-          track: ${{ github.event.inputs.track }}
-          releaseNotes: |
-            ${{ github.event.inputs.release_notes }}
-            
-            Build Info:
-            - Commit: ${{ github.sha }}
-            - Branch: ${{ github.ref_name }}
-            - Build: ${{ github.run_id }}
+          tracks: ${{ github.event.inputs.track }}
           status: completed
 
       - name: 🧹 Cleanup sensitive files
