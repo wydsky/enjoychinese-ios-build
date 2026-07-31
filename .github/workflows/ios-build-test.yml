@@ -198,6 +198,7 @@ jobs:
           echo "=== 开始构建测试环境 IPA ==="
           flutter build ipa \
             --release \
+            --verbose \
             --dart-define=ENV=test \
             --dart-define=TEST_API_HOST=http://test.enjoychinese.app \
             --dart-define=REVENUECAT_API_KEY=test_MlbQVInvEybRiQQBFLJmDkQJUmC \

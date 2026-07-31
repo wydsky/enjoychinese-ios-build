@@ -85,6 +85,7 @@ jobs:
           echo "=== Starting Android Test Build ==="
           flutter build appbundle \
             --release \
+            --verbose \
             --dart-define=ENV=test \
             --dart-define=TEST_API_HOST=http://test.enjoychinese.app \
             --dart-define=REVENUECAT_API_KEY=test_MlbQVInvEybRiQQBFLJmDkQJUmC
@@ -164,35 +165,37 @@ jobs:
     steps:
       - name: Notify success
         if: needs.build-apk.result == 'success'
-        uses: timonwong/notify-msg-action@v1
-        with:
-          type: wechat_work
-          corpid: ${{ secrets.WECHAT_WORK_CORPID }}
-          corpsecret: ${{ secrets.WECHAT_WORK_CORPSECRET }}
-          agentid: ${{ secrets.WECHAT_WORK_AGENTID }}
-          message: |
-            ✅ Android Build Succeeded
+        run: |
+          MESSAGE="✅ Android Test Build Succeeded
 
-            **Track:** ${{ github.event.inputs.track }}
-            **Commit:** ${{ github.sha }}
-            **Branch:** ${{ github.ref_name }}
-            **Release Notes:** ${{ github.event.inputs.release_notes }}
+          Track: ${{ github.event.inputs.track }}
+          Commit: ${{ github.sha }}
+          Branch: ${{ github.ref_name }}
+          Release Notes: ${{ github.event.inputs.release_notes }}
 
-            View: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          View: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          jq -n --arg content "$MESSAGE" '{
+            msgtype: "text",
+            text: { content: $content }
+          }' > /tmp/wechat_msg.json
+          curl -s -X POST "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=${{ secrets.WECHAT_WORK_WEBHOOK_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d @/tmp/wechat_msg.json
 
       - name: Notify failure
         if: needs.build-apk.result == 'failure'
-        uses: timonwong/notify-msg-action@v1
-        with:
-          type: wechat_work
-          corpid: ${{ secrets.WECHAT_WORK_CORPID }}
-          corpsecret: ${{ secrets.WECHAT_WORK_CORPSECRET }}
-          agentid: ${{ secrets.WECHAT_WORK_AGENTID }}
-          message: |
-            ❌ Android Build FAILED
+        run: |
+          MESSAGE="❌ Android Test Build FAILED
 
-            **Track:** ${{ github.event.inputs.track }}
-            **Commit:** ${{ github.sha }}
-            **Branch:** ${{ github.ref_name }}
+          Track: ${{ github.event.inputs.track }}
+          Commit: ${{ github.sha }}
+          Branch: ${{ github.ref_name }}
 
-            Check: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          Check: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          jq -n --arg content "$MESSAGE" '{
+            msgtype: "text",
+            text: { content: $content }
+          }' > /tmp/wechat_msg.json
+          curl -s -X POST "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=${{ secrets.WECHAT_WORK_WEBHOOK_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d @/tmp/wechat_msg.json

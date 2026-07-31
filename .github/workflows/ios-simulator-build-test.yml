@@ -70,6 +70,7 @@ jobs:
             --debug \
             --simulator \
             --no-codesign \
+            --verbose \
             --dart-define=ENV=test \
             --dart-define=TEST_API_HOST=http://test.enjoychinese.app \
             --dart-define=REVENUECAT_API_KEY=test_MlbQVInvEybRiQQBFLJmDkQJUmC
