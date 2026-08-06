@@ -86,7 +86,8 @@ jobs:
           flutter build appbundle \
             --release \
             --dart-define=ENV=prod \
-            --dart-define=PROD_API_HOST=${{ secrets.PROD_API_HOST }}
+            --dart-define=PROD_API_HOST=${{ secrets.PROD_API_HOST }} \
+            --dart-define=REVENUECAT_API_KEY=${{ secrets.REVENUECAT_GOOGLE_API_KEY }}
           echo ""
           echo "=== Build Completed ==="
 

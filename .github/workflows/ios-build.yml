@@ -200,6 +200,7 @@ jobs:
             --release \
             --dart-define=ENV=prod \
             --dart-define=PROD_API_HOST=${{ secrets.PROD_API_HOST }} \
+            --dart-define=REVENUECAT_API_KEY=${{ secrets.REVENUECAT_APPLE_API_KEY }} \
             --export-options-plist=ios/ExportOptions.plist
           echo ""
           echo "=== IPA 构建完成 ==="
