@@ -109,6 +109,24 @@ jobs:
             exit 1
           fi
 
+      - name: 🔍 Verify AAB Permissions (BILLING)
+        working-directory: ./source-code/enjoychinese_app
+        run: |
+          echo "=== Checking AAB Permissions ==="
+          AAB_PATH=$(find build/app/outputs/bundle/release -name "app-release.aab" -type f)
+          
+          echo "Checking $AAB_PATH ..."
+          aapt2 dump permissions "$AAB_PATH" > /tmp/aab_permissions.txt
+          
+          if grep -q "com.android.vending.BILLING" /tmp/aab_permissions.txt; then
+            echo "✅ Permission check passed: com.android.vending.BILLING found"
+          else
+            echo "❌ Permission check FAILED: com.android.vending.BILLING missing"
+            echo "Current AAB permissions:"
+            cat /tmp/aab_permissions.txt
+            exit 1
+          fi
+
       - name: 📦 Upload AAB artifact
         uses: actions/upload-artifact@v4
         with:

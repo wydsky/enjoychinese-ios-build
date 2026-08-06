@@ -224,6 +224,31 @@ jobs:
           echo "=== 签名验证 ==="
           codesign --verify --deep --strict build/ios/ipa_content/Payload/Runner.app 2>&1 || echo "签名验证失败"
 
+      - name: 🔍 验证步骤2.1：检查 IPA Entitlements (In-App Purchase)
+        working-directory: ./source-code/enjoychinese_app
+        run: |
+          echo "=== 检查 IPA Entitlements ==="
+          
+          # 确保已解压
+          IPA_PATH=$(find build/ios/ipa -name "*.ipa" -type f | head -1)
+          if [ ! -d "build/ios/ipa_content" ]; then
+            unzip -q "$IPA_PATH" -d build/ios/ipa_content
+          fi
+          
+          echo "正在检查 Entitlements..."
+          # 提取 Entitlements
+          codesign -d --entitlements - build/ios/ipa_content/Payload/Runner.app > /tmp/ios_entitlements.plist 2>&1
+          
+          # 检查是否包含 In-App Purchase 权限
+          if /usr/libexec/PlistBuddy -c "Print :com.apple.developer.in-app-payments" /tmp/ios_entitlements.plist 2>/dev/null; then
+            echo "✅ 权限验证成功: 包含 com.apple.developer.in-app-payments"
+          else
+            echo "❌ 权限验证失败: 缺少 com.apple.developer.in-app-payments"
+            echo "当前 Entitlements 内容:"
+            cat /tmp/ios_entitlements.plist
+            exit 1
+          fi
+
       - name: ✅ 验证步骤3：使用 altool 验证 App Store 兼容性
         working-directory: ./source-code/enjoychinese_app
         run: |
