@@ -28,7 +28,7 @@ jobs:
 
       - name: 📥 Pull private Gitee Flutter code
         run: |
-          git clone -b main https://oauth2:${{ secrets.GITEE_TOKEN }}@gitee.com/yunhaninfo/enjoy-chinese.git source-code
+          git clone -b client-release https://oauth2:${{ secrets.GITEE_TOKEN }}@gitee.com/yunhaninfo/enjoy-chinese.git source-code
           cd source-code
 
       - name: 🚀 Setup Flutter
@@ -59,7 +59,7 @@ jobs:
       - name: 🛠️ Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
-          api-level: 35
+          api-level: 36
           build-tools: 35.0.0
           ndk: 26.1.10909125
 
