@@ -237,7 +237,9 @@ jobs:
           AAB_PATH=$(find build/app/outputs/bundle/release -name "app-release.aab" -type f)
           
           echo "Checking $AAB_PATH ..."
-          aapt2 dump permissions "$AAB_PATH" > /tmp/aab_permissions.txt
+          AAPT2=$(find "$ANDROID_HOME/build-tools" -name aapt2 -type f | sort -V | tail -1)
+          echo "Using aapt2: $AAPT2"
+          $AAPT2 dump permissions "$AAB_PATH" > /tmp/aab_permissions.txt
           
           if grep -q "com.android.vending.BILLING" /tmp/aab_permissions.txt; then
             echo "✅ Permission check passed: com.android.vending.BILLING found"
