@@ -374,10 +374,10 @@ jobs:
           codesign -d --entitlements - build/ios/ipa_content/Payload/Runner.app > /tmp/ios_entitlements.plist 2>&1
           
           # 检查是否包含 In-App Purchase 权限
-          if /usr/libexec/PlistBuddy -c "Print :com.apple.developer.in-app-payments" /tmp/ios_entitlements.plist 2>/dev/null; then
-            echo "✅ 权限验证成功: 包含 com.apple.developer.in-app-payments"
+          if /usr/libexec/PlistBuddy -c "Print :com.apple.developer.in-app-purchases" /tmp/ios_entitlements.plist 2>/dev/null; then
+            echo "✅ 权限验证成功: 包含 com.apple.developer.in-app-purchases"
           else
-            echo "❌ 权限验证失败: 缺少 com.apple.developer.in-app-payments"
+            echo "❌ 权限验证失败: 缺少 com.apple.developer.in-app-purchases"
             echo "当前 Entitlements 内容:"
             cat /tmp/ios_entitlements.plist
             exit 1
