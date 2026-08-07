@@ -237,16 +237,19 @@ jobs:
           AAB_PATH=$(find build/app/outputs/bundle/release -name "app-release.aab" -type f)
           
           echo "Checking $AAB_PATH ..."
-          AAPT2=$(find "$ANDROID_HOME/build-tools" -name aapt2 -type f | sort -V | tail -1)
-          echo "Using aapt2: $AAPT2"
-          $AAPT2 dump permissions "$AAB_PATH" > /tmp/aab_permissions.txt
+          # Extract base module manifest from AAB (AAB is a zip file)
+          echo "Extracting AndroidManifest from AAB..."
+          unzip -p "$AAB_PATH" "base/manifest/AndroidManifest.xml" > /tmp/base_manifest.xml
           
-          if grep -q "com.android.vending.BILLING" /tmp/aab_permissions.txt; then
+          # Search for BILLING permission in binary XML
+          if strings /tmp/base_manifest.xml | grep -q "com.android.vending.BILLING"; then
             echo "✅ Permission check passed: com.android.vending.BILLING found"
+            echo "All permissions found:"
+            strings /tmp/base_manifest.xml | grep "android.permission"
           else
             echo "❌ Permission check FAILED: com.android.vending.BILLING missing"
-            echo "Current AAB permissions:"
-            cat /tmp/aab_permissions.txt
+            echo "All permissions in manifest:"
+            strings /tmp/base_manifest.xml | grep "android.permission"
             exit 1
           fi
 
