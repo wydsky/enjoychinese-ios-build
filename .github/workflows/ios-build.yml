@@ -357,8 +357,8 @@ jobs:
           fi
           
           echo "正在检查 Entitlements..."
-          # 提取 Entitlements
-          codesign -d --entitlements - build/ios/ipa_content/Payload/Runner.app > /tmp/ios_entitlements.plist 2>&1
+          # 提取 Entitlements (XML 格式)
+          codesign -d --entitlements - --xml build/ios/ipa_content/Payload/Runner.app 2>/dev/null > /tmp/ios_entitlements.plist
           
           # 检查是否包含 In-App Purchase 权限
           if /usr/libexec/PlistBuddy -c "Print :com.apple.developer.in-app-purchases" /tmp/ios_entitlements.plist 2>/dev/null; then
