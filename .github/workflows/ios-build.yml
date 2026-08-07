@@ -200,6 +200,36 @@ jobs:
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
           echo "${{ secrets.PROV_RELEASE_BASE64 }}" | base64 -d > ~/Library/MobileDevice/Provisioning\ Profiles/prod_enjoychinese.mobileprovision
 
+      - name: 🔍 验证 Provisioning Profile 内容
+        run: |
+          PROFILE_PATH=~/Library/MobileDevice/Provisioning\ Profiles/prod_enjoychinese.mobileprovision
+          echo "=== Provisioning Profile 信息 ==="
+          security cms -D -i "$PROFILE_PATH" > /tmp/profile.plist
+          
+          echo "Name: $(/usr/libexec/PlistBuddy -c "Print :Name" /tmp/profile.plist)"
+          echo "App ID: $(/usr/libexec/PlistBuddy -c "Print :Entitlements:application-identifier" /tmp/profile.plist)"
+          echo "Expires: $(/usr/libexec/PlistBuddy -c "Print :ExpirationDate" /tmp/profile.plist)"
+          echo ""
+          echo "=== Entitlements 检查 ==="
+          
+          # Check for In-App Purchase
+          if /usr/libexec/PlistBuddy -c "Print :Entitlements:com.apple.developer.in-app-purchases" /tmp/profile.plist 2>/dev/null; then
+            echo "✅ Profile 包含 com.apple.developer.in-app-purchases"
+          else
+            echo "❌ Profile 缺少 com.apple.developer.in-app-purchases"
+            echo ""
+            echo "Profile 中所有 Entitlements:"
+            /usr/libexec/PlistBuddy -c "Print :Entitlements" /tmp/profile.plist
+            exit 1
+          fi
+          
+          # Check for Apple Pay
+          if /usr/libexec/PlistBuddy -c "Print :Entitlements:com.apple.developer.in-app-payments" /tmp/profile.plist 2>/dev/null; then
+            echo "⚠️  Profile 包含 com.apple.developer.in-app-payments (Apple Pay)"
+          else
+            echo "ℹ️  Profile 不包含 Apple Pay 能力"
+          fi
+
       - name: 📝 生成导出配置（发布模式）
         working-directory: ./source-code/enjoychinese_app/ios
         run: |
