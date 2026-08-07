@@ -51,7 +51,7 @@ jobs:
           echo "  Build number: $BUILD_NUMBER"
           
           # Read stored version from deploy repo tracking file
-          VERSION_FILE="$GITHUB_WORKSPACE/deploy/ios-android-build/version-ios.txt"
+          VERSION_FILE="$GITHUB_WORKSPACE/.github/deploy/version-ios.txt"
           if [ -f "$VERSION_FILE" ]; then
             STORED_BUILD=$(cat "$VERSION_FILE" | tr -d ' \n')
           else

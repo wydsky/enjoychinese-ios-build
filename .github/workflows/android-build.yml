@@ -48,7 +48,7 @@ jobs:
           echo "  Build number: $BUILD_NUMBER"
           
           # Read stored version from deploy repo tracking file
-          VERSION_FILE="$GITHUB_WORKSPACE/deploy/ios-android-build/version-android.txt"
+          VERSION_FILE="$GITHUB_WORKSPACE/.github/deploy/version-android.txt"
           if [ -f "$VERSION_FILE" ]; then
             STORED_BUILD=$(cat "$VERSION_FILE" | tr -d ' \n')
           else
@@ -108,7 +108,7 @@ jobs:
           git config user.name "jenkins-cicd"
           git config user.email "jenkins@enjoychinese.app"
           git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          git add deploy/ios-android-build/version-android.txt
+          git add .github/version-android.txt
           
           if git diff --cached --quiet; then
             echo "ℹ️  No tracking file changes to commit to deploy repo"
