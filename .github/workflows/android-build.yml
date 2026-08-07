@@ -110,7 +110,7 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           git config user.name "jenkins-cicd"
           git config user.email "jenkins@enjoychinese.app"
-          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git remote set-url origin "https://x-access-token:${GH_PAT}@github.com/${GITHUB_REPOSITORY}.git"
           git add "$VERSION_TRACK_FILE"
           
           if git diff --cached --quiet; then
@@ -128,6 +128,7 @@ jobs:
         env:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}
 
       - name: 🚀 Setup Flutter
         uses: subosito/flutter-action@v2
