@@ -107,18 +107,53 @@ jobs:
           # Commit version tracking file to deploy repo (GitHub)
           echo ""
           echo "=== Committing to deploy repo ==="
-          cd "$GITHUB_WORKSPACE"
-          git config user.name "jenkins-cicd"
-          git config user.email "jenkins@enjoychinese.app"
-          git remote set-url origin "https://x-access-token:${GH_PAT}@github.com/${GITHUB_REPOSITORY}.git"
-          git add "$VERSION_TRACK_FILE"
+          COMMIT_MSG="chore: update Android build version tracking to $NEW_BUILD [skip ci]"
+          ENCODED_CONTENT=$(echo -n "$NEW_BUILD" | base64 -w 0)
           
-          if git diff --cached --quiet; then
-            echo "ℹ️  No tracking file changes to commit to deploy repo"
+          # Get current file SHA (if file exists) via GitHub API
+          API_URL="https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/${VERSION_TRACK_FILE}"
+          HTTP_CODE=$(curl -s -o /tmp/api_response.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${GH_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            "$API_URL")
+          
+          if [ "$HTTP_CODE" = "200" ]; then
+            FILE_SHA=$(python3 -c "import json; print(json.load(open('/tmp/api_response.json'))['sha'])")
+            echo "Existing file SHA: $FILE_SHA"
+            JSON_BODY=$(python3 -c "
+            import json
+            print(json.dumps({
+                'message': '$COMMIT_MSG',
+                'content': '$ENCODED_CONTENT',
+                'sha': '$FILE_SHA'
+            }))
+            ")
           else
-            git commit -m "chore: update Android build version tracking to $NEW_BUILD [skip ci]"
-            git push origin HEAD:${GITHUB_REF_NAME:-main}
-            echo "✅ Successfully pushed to deploy repo"
+            echo "File does not exist yet, creating new file"
+            JSON_BODY=$(python3 -c "
+            import json
+            print(json.dumps({
+                'message': '$COMMIT_MSG',
+                'content': '$ENCODED_CONTENT'
+            }))
+            ")
+          fi
+          
+          # Update file via GitHub API
+          UPDATE_CODE=$(curl -s -o /tmp/update_response.json -w "%{http_code}" \
+            -X PUT \
+            -H "Authorization: Bearer ${GH_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            -d "$JSON_BODY" \
+            "$API_URL")
+          
+          if [ "$UPDATE_CODE" = "200" ] || [ "$UPDATE_CODE" = "201" ]; then
+            echo "✅ Successfully updated deploy repo via GitHub API"
+          else
+            echo "❌ Failed to update deploy repo (HTTP $UPDATE_CODE)"
+            cat /tmp/update_response.json
+            exit 1
           fi
           
           echo ""
