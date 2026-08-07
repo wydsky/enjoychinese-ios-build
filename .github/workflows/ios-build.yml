@@ -212,22 +212,15 @@ jobs:
           echo ""
           echo "=== Entitlements 检查 ==="
           
-          # Check for In-App Purchase
-          if /usr/libexec/PlistBuddy -c "Print :Entitlements:com.apple.developer.in-app-purchases" /tmp/profile.plist 2>/dev/null; then
-            echo "✅ Profile 包含 com.apple.developer.in-app-purchases"
-          else
-            echo "❌ Profile 缺少 com.apple.developer.in-app-purchases"
-            echo ""
-            echo "Profile 中所有 Entitlements:"
-            /usr/libexec/PlistBuddy -c "Print :Entitlements" /tmp/profile.plist
-            exit 1
-          fi
+          # IAP is implicit for App Store distribution, not explicitly listed
+          echo "ℹ️  In-App Purchase is an implicit default for App Store distribution"
           
-          # Check for Apple Pay
+          # Check for Apple Pay (should NOT be present)
           if /usr/libexec/PlistBuddy -c "Print :Entitlements:com.apple.developer.in-app-payments" /tmp/profile.plist 2>/dev/null; then
-            echo "⚠️  Profile 包含 com.apple.developer.in-app-payments (Apple Pay)"
+            echo "❌ Profile 包含 com.apple.developer.in-app-payments (Apple Pay) - 不应该存在"
+            exit 1
           else
-            echo "ℹ️  Profile 不包含 Apple Pay 能力"
+            echo "✅ Profile 不含 Apple Pay 能力"
           fi
 
       - name: 📝 生成导出配置（发布模式）
@@ -390,14 +383,17 @@ jobs:
           # 提取 Entitlements (XML 格式)
           codesign -d --entitlements - --xml build/ios/ipa_content/Payload/Runner.app 2>/dev/null > /tmp/ios_entitlements.plist
           
-          # 检查是否包含 In-App Purchase 权限
-          if /usr/libexec/PlistBuddy -c "Print :com.apple.developer.in-app-purchases" /tmp/ios_entitlements.plist 2>/dev/null; then
-            echo "✅ 权限验证成功: 包含 com.apple.developer.in-app-purchases"
-          else
-            echo "❌ 权限验证失败: 缺少 com.apple.developer.in-app-purchases"
+          # IAP is implicit for App Store distribution, not explicitly listed in IPA
+          echo "ℹ️  In-App Purchase is an implicit default for App Store distribution"
+          
+          # Check Apple Pay is NOT present (should not be in the IPA)
+          if /usr/libexec/PlistBuddy -c "Print :com.apple.developer.in-app-payments" /tmp/ios_entitlements.plist 2>/dev/null; then
+            echo "❌ IPA 包含 com.apple.developer.in-app-payments (Apple Pay) - 不应该存在"
             echo "当前 Entitlements 内容:"
             cat /tmp/ios_entitlements.plist
             exit 1
+          else
+            echo "✅ IPA 不包含 Apple Pay 能力"
           fi
 
       - name: ✅ 验证步骤3：使用 altool 验证 App Store 兼容性
