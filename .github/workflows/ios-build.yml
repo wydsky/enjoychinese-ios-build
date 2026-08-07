@@ -34,6 +34,101 @@ jobs:
           git clone -b client-release https://oauth2:${{ secrets.GITEE_TOKEN }}@gitee.com/yunhaninfo/enjoy-chinese.git source-code
           cd source-code
 
+      - name: 🔢 Manage iOS Build Version
+        working-directory: ./source-code
+        run: |
+          set -e
+          echo "========================================"
+          echo "🔢 Managing iOS Build Version"
+          echo "========================================"
+          
+          # Read current version from pubspec.yaml
+          CURRENT_VERSION=$(grep "^version:" enjoychinese_app/pubspec.yaml | sed 's/version: *//' | tr -d ' ')
+          VERSION_NAME=$(echo "$CURRENT_VERSION" | cut -d+ -f1)
+          BUILD_NUMBER=$(echo "$CURRENT_VERSION" | cut -d+ -f2)
+          echo "Current version: $CURRENT_VERSION"
+          echo "  Version name: $VERSION_NAME"
+          echo "  Build number: $BUILD_NUMBER"
+          
+          # Read stored version from deploy repo tracking file
+          VERSION_FILE="$GITHUB_WORKSPACE/deploy/ios-android-build/version-ios.txt"
+          if [ -f "$VERSION_FILE" ]; then
+            STORED_BUILD=$(cat "$VERSION_FILE" | tr -d ' \n')
+          else
+            STORED_BUILD="0"
+            echo "ℹ️  Version tracking file not found, initializing to 0"
+          fi
+          echo "Stored build number: $STORED_BUILD"
+          
+          # Compare and auto-increment if needed
+          NEW_BUILD=$BUILD_NUMBER
+          if [ "$BUILD_NUMBER" -le "$STORED_BUILD" ] 2>/dev/null; then
+            NEW_BUILD=$((STORED_BUILD + 1))
+            NEW_VERSION="${VERSION_NAME}+${NEW_BUILD}"
+            echo "⬆️  Auto-incrementing: $CURRENT_VERSION → $NEW_VERSION"
+            
+            # Update pubspec.yaml using Python (cross-platform)
+            python3 -c "
+            import re
+            with open('enjoychinese_app/pubspec.yaml', 'r') as f:
+                content = f.read()
+            content = re.sub(r'^version: .*', 'version: $NEW_VERSION', content, flags=re.MULTILINE)
+            with open('enjoychinese_app/pubspec.yaml', 'w') as f:
+                f.write(content)
+            print('✅ Updated pubspec.yaml to version: $NEW_VERSION')
+            "
+            UPDATED_VERSION="$NEW_VERSION"
+          else
+            UPDATED_VERSION="$CURRENT_VERSION"
+            echo "🔁 Syncing tracking file: pubspec.yaml ($BUILD_NUMBER) > stored ($STORED_BUILD)"
+            echo "   → version tracking file will be synced to $BUILD_NUMBER"
+          fi
+          
+          # Update version tracking file in deploy repo
+          echo "$NEW_BUILD" > "$VERSION_FILE"
+          echo "✅ Updated version tracking file: $NEW_BUILD (previously: $STORED_BUILD)"
+          
+          # Commit pubspec.yaml changes to Gitee
+          echo ""
+          echo "=== Committing to Gitee ==="
+          git config user.name "jenkins-cicd"
+          git config user.email "jenkins@enjoychinese.app"
+          git add enjoychinese_app/pubspec.yaml
+          
+          if git diff --cached --quiet; then
+            echo "ℹ️  No pubspec.yaml changes to commit to Gitee"
+          else
+            git commit -m "chore: auto-increment iOS build version to $UPDATED_VERSION [skip ci]"
+            REMOTE_URL="https://oauth2:${GITEE_TOKEN}@gitee.com/yunhaninfo/enjoy-chinese.git"
+            git push "$REMOTE_URL" HEAD:client-release
+            echo "✅ Successfully pushed to Gitee"
+          fi
+          
+          # Commit version tracking file to deploy repo (GitHub)
+          echo ""
+          echo "=== Committing to deploy repo ==="
+          cd "$GITHUB_WORKSPACE"
+          git config user.name "jenkins-cicd"
+          git config user.email "jenkins@enjoychinese.app"
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git add deploy/ios-android-build/version-ios.txt
+          
+          if git diff --cached --quiet; then
+            echo "ℹ️  No tracking file changes to commit to deploy repo"
+          else
+            git commit -m "chore: update iOS build version tracking to $NEW_BUILD [skip ci]"
+            git push origin HEAD:${GITHUB_REF_NAME:-main}
+            echo "✅ Successfully pushed to deploy repo"
+          fi
+          
+          echo ""
+          echo "========================================"
+          echo "✅ Version Management Complete: $UPDATED_VERSION"
+          echo "========================================"
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: 🚀 配置 Flutter
         uses: subosito/flutter-action@v2
         with:
