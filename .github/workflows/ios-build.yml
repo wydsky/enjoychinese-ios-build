@@ -70,16 +70,9 @@ jobs:
             NEW_VERSION="${VERSION_NAME}+${NEW_BUILD}"
             echo "⬆️  Auto-incrementing: $CURRENT_VERSION → $NEW_VERSION"
             
-            # Update pubspec.yaml using Python (cross-platform)
-            python3 -c "
-            import re
-            with open('enjoychinese_app/pubspec.yaml', 'r') as f:
-                content = f.read()
-            content = re.sub(r'^version: .*', 'version: $NEW_VERSION', content, flags=re.MULTILINE)
-            with open('enjoychinese_app/pubspec.yaml', 'w') as f:
-                f.write(content)
-            print('✅ Updated pubspec.yaml to version: $NEW_VERSION')
-            "
+            # Update pubspec.yaml using perl (cross-platform)
+            perl -i -pe "s/^version: .*/version: ${NEW_VERSION}/" enjoychinese_app/pubspec.yaml
+            echo "✅ Updated pubspec.yaml to version: $NEW_VERSION"
             UPDATED_VERSION="$NEW_VERSION"
           else
             UPDATED_VERSION="$CURRENT_VERSION"
@@ -123,23 +116,17 @@ jobs:
           if [ "$HTTP_CODE" = "200" ]; then
             FILE_SHA=$(python3 -c "import json; print(json.load(open('/tmp/api_response.json'))['sha'])")
             echo "Existing file SHA: $FILE_SHA"
-            JSON_BODY=$(python3 -c "
-            import json
-            print(json.dumps({
-                'message': '$COMMIT_MSG',
-                'content': '$ENCODED_CONTENT',
-                'sha': '$FILE_SHA'
-            }))
-            ")
+            JSON_BODY=$(jq -n \
+              --arg msg "$COMMIT_MSG" \
+              --arg content "$ENCODED_CONTENT" \
+              --arg sha "$FILE_SHA" \
+              '{message: $msg, content: $content, sha: $sha}')
           else
             echo "File does not exist yet, creating new file"
-            JSON_BODY=$(python3 -c "
-            import json
-            print(json.dumps({
-                'message': '$COMMIT_MSG',
-                'content': '$ENCODED_CONTENT'
-            }))
-            ")
+            JSON_BODY=$(jq -n \
+              --arg msg "$COMMIT_MSG" \
+              --arg content "$ENCODED_CONTENT" \
+              '{message: $msg, content: $content}')
           fi
           
           # Update file via GitHub API
