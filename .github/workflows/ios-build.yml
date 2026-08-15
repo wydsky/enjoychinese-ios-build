@@ -424,6 +424,36 @@ jobs:
           name: enjoychinese-prod-ipa
           path: ./source-code/enjoychinese_app/build/ios/ipa/*.ipa
 
+      - name: 📦 保存 dSYM 文件（供后续 Firebase Crashlytics 上传）
+        working-directory: ./source-code/enjoychinese_app
+        run: |
+          echo "=== 查找 dSYM 文件 ==="
+          DSYM_DIR="build/ios/archive/Runner.xcarchive/dSYMs"
+          if [ -d "$DSYM_DIR" ]; then
+            echo "✅ 找到 dSYMs 目录:"
+            ls -la "$DSYM_DIR"
+            echo ""
+            echo "=== 压缩 dSYM 文件 ==="
+            # 压缩为单个 zip 文件方便上传/下载
+            cd build/ios/archive
+            zip -r -X Runner.xcarchive.dSYMs.zip Runner.xcarchive/dSYMs/
+            echo ""
+            echo "✅ dSYM 压缩完成"
+            ls -lh Runner.xcarchive.dSYMs.zip
+          else
+            echo "❌ 未找到 dSYMs 目录: $DSYM_DIR"
+            echo "尝试查找其他位置..."
+            find build/ios -name "*.dSYM" -type d 2>/dev/null || echo "未找到任何 .dSYM 文件"
+            exit 1
+          fi
+
+      - name: 📤 上传 dSYM 文件（Artifact）
+        uses: actions/upload-artifact@v4
+        with:
+          name: enjoychinese-prod-dsym
+          path: ./source-code/enjoychinese_app/build/ios/archive/Runner.xcarchive.dSYMs.zip
+          retention-days: 90  # 保留90天，与 App Store 构建保留周期一致
+
       - name: 📊 构建结果报告
         run: |
           echo "========================================"

@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       build_number:
-        description: 'App Store Connect 构建号 (build number)'
+        description: '构建号 (build number)，用于验证和报告'
         required: true
         type: string
       bundle_id:
@@ -12,11 +12,16 @@ on:
         required: false
         default: 'com.enjoychinese.app'
         type: string
+      artifact_run_id:
+        description: 'iOS Build 工作流的 Run ID（留空则从 App Store Connect 下载）'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   upload_dsym:
     runs-on: macos-latest
-    name: 下载 dSYM 并上传 Firebase Crashlytics
+    name: 上传 dSYM 到 Firebase Crashlytics
     env:
       APPLE_KEY_ID: ${{ secrets.APPLE_KEY_ID }}
       APPLE_ISSUER_ID: ${{ secrets.APPLE_ISSUER_ID }}
@@ -36,12 +41,47 @@ jobs:
           cd source-code/enjoychinese_app/ios
           bundle install
 
-      - name: 📦 下载 dSYM 并上传 Firebase Crashlytics
+      # ── 方式 A：从 GitHub Artifact 获取 dSYM ──
+      - name: � 下载 dSYM Artifact（从 iOS Build 工作流）
+        if: ${{ github.event.inputs.artifact_run_id != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: enjoychinese-prod-dsym
+          github-token: ${{ secrets.GH_PAT }}
+          run-id: ${{ github.event.inputs.artifact_run_id }}
+          repository: ${{ github.repository }}
+
+      - name: 📦 解压 dSYM Artifact
+        if: ${{ github.event.inputs.artifact_run_id != '' }}
+        run: |
+          mkdir -p source-code/enjoychinese_app/ios/tmp_dsym
+          unzip -o Runner.xcarchive.dSYMs.zip -d source-code/enjoychinese_app/ios/tmp_dsym_zip
+          # 解压后目录结构可能是 Runner.xcarchive/dSYMs/，需要提取 dSYM 文件
+          find source-code/enjoychinese_app/ios/tmp_dsym_zip -name "*.dSYM" -type d | while read dsym; do
+            cp -R "$dsym" source-code/enjoychinese_app/ios/tmp_dsym/
+          done
+          echo "=== dSYM 文件列表 ==="
+          ls -la source-code/enjoychinese_app/ios/tmp_dsym/
+          echo ""
+          echo "=== 文件数量和大小 ==="
+          find source-code/enjoychinese_app/ios/tmp_dsym -type f | wc -l
+          du -sh source-code/enjoychinese_app/ios/tmp_dsym/
+
+      # ── 方式 B：从 App Store Connect 下载 dSYM ──
+      - name: 📦 从 App Store Connect 下载 dSYM
+        if: ${{ github.event.inputs.artifact_run_id == '' }}
         run: |
           cd source-code/enjoychinese_app/ios
           bundle exec fastlane download_and_upload_dsym \
             build_number:${{ github.event.inputs.build_number }} \
             bundle_id:${{ github.event.inputs.bundle_id }}
+
+      # ── 上传到 Firebase Crashlytics ──
+      - name: 📤 上传 dSYM 到 Firebase Crashlytics
+        working-directory: ./source-code/enjoychinese_app/ios
+        run: |
+          bundle exec fastlane upload_dsym_only \
+            build_number:${{ github.event.inputs.build_number }}
 
       - name: ✅ 验证上传结果
         run: |
@@ -50,6 +90,7 @@ jobs:
           echo "========================================"
           echo "构建号: ${{ github.event.inputs.build_number }}"
           echo "Bundle ID: ${{ github.event.inputs.bundle_id }}"
+          echo "dSYM 来源: ${{ github.event.inputs.artifact_run_id != '' && 'GitHub Artifact' || 'App Store Connect' }}"
           echo ""
           echo "本地 dSYM 文件:"
           if [ -d "source-code/enjoychinese_app/ios/tmp_dsym" ]; then
@@ -58,7 +99,7 @@ jobs:
             TOTAL_SIZE=$(du -sh source-code/enjoychinese_app/ios/tmp_dsym 2>/dev/null | cut -f1)
             echo "总大小: $TOTAL_SIZE"
           else
-            echo "⚠️  tmp_dsym 目录不存在（可能已被清理）"
+            echo "⚠️  tmp_dsym 目录不存在"
           fi
           echo ""
           echo "========================================"
