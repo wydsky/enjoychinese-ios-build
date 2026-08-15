@@ -32,14 +32,14 @@ jobs:
 
       - name: 💎 安装 Fastlane 及 Firebase Crashlytics 插件
         run: |
-          gem install fastlane
+          gem install fastlane bundler
           cd source-code/enjoychinese_app/ios
-          fastlane add_plugin firebase_crashlytics
+          bundle install
 
       - name: 📦 下载 dSYM 并上传 Firebase Crashlytics
         run: |
           cd source-code/enjoychinese_app/ios
-          fastlane download_and_upload_dsym \
+          bundle exec fastlane download_and_upload_dsym \
             build_number:${{ github.event.inputs.build_number }} \
             bundle_id:${{ github.event.inputs.bundle_id }}
 
