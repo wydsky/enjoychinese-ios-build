@@ -170,6 +170,10 @@ jobs:
         working-directory: ./source-code/enjoychinese_app
         run: flutter pub get
 
+      - name: 🏗️ Generate code (json_serializable, etc.)
+        working-directory: ./source-code/enjoychinese_app
+        run: dart run build_runner build --delete-conflicting-outputs
+
       - name: 🛠️ Setup Java 17
         uses: actions/setup-java@v4
         with:
