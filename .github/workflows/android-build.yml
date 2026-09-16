@@ -182,11 +182,25 @@ jobs:
           cache: 'gradle'
 
       - name: 🛠️ Setup Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          api-level: 36
-          build-tools: 35.0.0
-          ndk: 26.1.10909125
+        run: |
+          # 使用 runner 自带 SDK 手动安装所需组件，绕开 setup-android@v3 中
+          # 已不存在（被 Google 下线）的 legacy "tools" 包导致的偶发失败。
+          SDK=${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          # 定位 sdkmanager：旧镜像为 latest，新镜像为具体版本目录（如 16.0）
+          SCM=""
+          for d in "$SDK"/cmdline-tools/*/; do
+            if [ -x "$d/bin/sdkmanager" ]; then SCM="$d/bin/sdkmanager"; break; fi
+          done
+          [ -n "$SCM" ] || SCM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          echo "sdkmanager: $SCM"
+          yes | "$SCM" --licenses --sdk_root="$SDK" >/dev/null || true
+          "$SCM" --sdk_root="$SDK" \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;35.0.0" \
+            "ndk;26.1.10909125"
 
       - name: 🔑 Decode keystore file
         run: |
