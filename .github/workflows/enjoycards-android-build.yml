@@ -1,0 +1,365 @@
+name: EnjoyCards Android Release Build & Google Play Upload
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_notes:
+        description: 'Release notes for this build'
+        required: true
+        default: 'Bug fixes and performance improvements'
+      track:
+        description: 'Google Play track to upload to'
+        required: true
+        default: 'internal'
+        type: choice
+        options:
+          - internal
+          - alpha
+          - beta
+          - production
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    name: Build EnjoyCards AAB & Upload to Google Play
+    permissions:
+      contents: write
+    steps:
+      - name: 📋 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 📥 Pull private Gitee Flutter code
+        run: |
+          git clone -b client-release https://oauth2:${{ secrets.GITEE_TOKEN }}@gitee.com/yunhaninfo/enjoy-chinese.git source-code
+          cd source-code
+
+      - name: 🔢 Manage Android Build Version
+        working-directory: ./source-code
+        run: |
+          set -e
+          echo "========================================"
+          echo "🔢 Managing EnjoyCards Android Build Version"
+          echo "========================================"
+
+          # Read current version from pubspec.yaml
+          CURRENT_VERSION=$(grep "^version:" enjoycards_app/pubspec.yaml | sed 's/version: *//' | tr -d ' ')
+          VERSION_NAME=$(echo "$CURRENT_VERSION" | cut -d+ -f1)
+          BUILD_NUMBER=$(echo "$CURRENT_VERSION" | cut -d+ -f2)
+          echo "Current version: $CURRENT_VERSION"
+          echo "  Version name: $VERSION_NAME"
+          echo "  Build number: $BUILD_NUMBER"
+
+          # Read stored version from deploy repo tracking file
+          VERSION_TRACK_FILE=".github/deploy/version-enjoycards-android.txt"
+          VERSION_FILE="$GITHUB_WORKSPACE/$VERSION_TRACK_FILE"
+          if [ -f "$VERSION_FILE" ]; then
+            STORED_BUILD=$(cat "$VERSION_FILE" | tr -d ' \n')
+          else
+            STORED_BUILD="0"
+            echo "ℹ️  Version tracking file not found, initializing to 0"
+          fi
+          echo "Stored build number: $STORED_BUILD"
+
+          # Compare and auto-increment if needed
+          NEW_BUILD=$BUILD_NUMBER
+          if [ "$BUILD_NUMBER" -le "$STORED_BUILD" ] 2>/dev/null; then
+            NEW_BUILD=$((STORED_BUILD + 1))
+            NEW_VERSION="${VERSION_NAME}+${NEW_BUILD}"
+            echo "⬆️  Auto-incrementing: $CURRENT_VERSION → $NEW_VERSION"
+
+            # Update pubspec.yaml using perl (cross-platform)
+            perl -i -pe "s/^version: .*/version: ${NEW_VERSION}/" enjoycards_app/pubspec.yaml
+            echo "✅ Updated pubspec.yaml to version: $NEW_VERSION"
+            UPDATED_VERSION="$NEW_VERSION"
+          else
+            UPDATED_VERSION="$CURRENT_VERSION"
+            echo "🔁 Syncing tracking file: pubspec.yaml ($BUILD_NUMBER) > stored ($STORED_BUILD)"
+            echo "   → version tracking file will be synced to $BUILD_NUMBER"
+          fi
+
+          # Update version tracking file in deploy repo
+          mkdir -p "$(dirname "$VERSION_FILE")"
+          echo "$NEW_BUILD" > "$VERSION_FILE"
+          echo "✅ Updated version tracking file: $NEW_BUILD (previously: $STORED_BUILD)"
+
+          # Commit pubspec.yaml changes to Gitee
+          echo ""
+          echo "=== Committing to Gitee ==="
+          git config user.name "jenkins-cicd"
+          git config user.email "jenkins@enjoychinese.app"
+          git add enjoycards_app/pubspec.yaml
+
+          if git diff --cached --quiet; then
+            echo "ℹ️  No pubspec.yaml changes to commit to Gitee"
+          else
+            git commit -m "chore: auto-increment EnjoyCards Android build version to $UPDATED_VERSION [skip ci]"
+            REMOTE_URL="https://oauth2:${GITEE_TOKEN}@gitee.com/yunhaninfo/enjoy-chinese.git"
+            git push "$REMOTE_URL" HEAD:client-release
+            echo "✅ Successfully pushed to Gitee"
+          fi
+
+          # Commit version tracking file to deploy repo (GitHub)
+          echo ""
+          echo "=== Committing to deploy repo ==="
+          COMMIT_MSG="chore: update EnjoyCards Android build version tracking to $NEW_BUILD [skip ci]"
+          ENCODED_CONTENT=$(echo -n "$NEW_BUILD" | base64 -w 0)
+
+          # Get current file SHA (if file exists) via GitHub API
+          API_URL="https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/${VERSION_TRACK_FILE}"
+          HTTP_CODE=$(curl -s -o /tmp/api_response.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${GH_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            "$API_URL")
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            FILE_SHA=$(python3 -c "import json; print(json.load(open('/tmp/api_response.json'))['sha'])")
+            echo "Existing file SHA: $FILE_SHA"
+            JSON_BODY=$(jq -n \
+              --arg msg "$COMMIT_MSG" \
+              --arg content "$ENCODED_CONTENT" \
+              --arg sha "$FILE_SHA" \
+              '{message: $msg, content: $content, sha: $sha}')
+          else
+            echo "File does not exist yet, creating new file"
+            JSON_BODY=$(jq -n \
+              --arg msg "$COMMIT_MSG" \
+              --arg content "$ENCODED_CONTENT" \
+              '{message: $msg, content: $content}')
+          fi
+
+          # Update file via GitHub API
+          UPDATE_CODE=$(curl -s -o /tmp/update_response.json -w "%{http_code}" \
+            -X PUT \
+            -H "Authorization: Bearer ${GH_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            -d "$JSON_BODY" \
+            "$API_URL")
+
+          if [ "$UPDATE_CODE" = "200" ] || [ "$UPDATE_CODE" = "201" ]; then
+            echo "✅ Successfully updated deploy repo via GitHub API"
+          else
+            echo "❌ Failed to update deploy repo (HTTP $UPDATE_CODE)"
+            cat /tmp/update_response.json
+            exit 1
+          fi
+
+          echo ""
+          echo "========================================"
+          echo "✅ Version Management Complete: $UPDATED_VERSION"
+          echo "========================================"
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+
+      - name: 🚀 Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.2'
+          channel: stable
+
+      - name: 💾 Cache Flutter dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            ./source-code/enjoycards_app/.dart_tool
+          key: ${{ runner.os }}-enjoycards-flutter-${{ hashFiles('source-code/enjoycards_app/pubspec.lock') }}
+
+      - name: 📦 Install Flutter dependencies
+        working-directory: ./source-code/enjoycards_app
+        run: flutter pub get
+
+      - name: 🏗️ Generate code (json_serializable, etc.)
+        working-directory: ./source-code/enjoycards_app
+        run: dart run build_runner build --delete-conflicting-outputs
+
+      - name: 🛠️ Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: 🛠️ Setup Android SDK
+        run: |
+          # 使用 runner 自带 SDK 手动安装所需组件，绕开 setup-android@v3 中
+          # 已不存在（被 Google 下线）的 legacy "tools" 包导致的偶发失败。
+          SDK=${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          # 定位 sdkmanager：旧镜像为 latest，新镜像为具体版本目录（如 16.0）
+          SCM=""
+          for d in "$SDK"/cmdline-tools/*/; do
+            if [ -x "$d/bin/sdkmanager" ]; then SCM="$d/bin/sdkmanager"; break; fi
+          done
+          [ -n "$SCM" ] || SCM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          echo "sdkmanager: $SCM"
+          yes | "$SCM" --licenses --sdk_root="$SDK" >/dev/null || true
+          "$SCM" --sdk_root="$SDK" \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;35.0.0" \
+            "ndk;26.1.10909125"
+
+      - name: 🔑 Decode keystore file
+        run: |
+          mkdir -p ./source-code/enjoycards_app/android/app/keys
+          echo "${{ secrets.ENJOYCARDS_ANDROID_KEYSTORE_BASE64 }}" | base64 -d > ./source-code/enjoycards_app/android/app/keys/enjoycards-release.jks
+
+      - name: 📝 Generate key.properties
+        working-directory: ./source-code/enjoycards_app/android
+        run: |
+          cat > key.properties <<EOF
+          # build.gradle.kts 位于 android/app，file() 从 android/app 目录解析路径
+          storeFile=./keys/enjoycards-release.jks
+          storePassword=${{ secrets.ENJOYCARDS_ANDROID_KEYSTORE_PASSWORD }}
+          keyAlias=${{ secrets.ENJOYCARDS_ANDROID_KEY_ALIAS }}
+          keyPassword=${{ secrets.ENJOYCARDS_ANDROID_KEY_PASSWORD }}
+          EOF
+
+      - name: 🔨 Build AAB (Release)
+        working-directory: ./source-code/enjoycards_app
+        run: |
+          echo "=== Starting EnjoyCards Android Release Build ==="
+          flutter build appbundle \
+            --release \
+            --dart-define=ENV=prod \
+            --dart-define=PROD_API_HOST=${{ secrets.PROD_API_HOST }} \
+            --dart-define=REVENUECAT_API_KEY=${{ secrets.REVENUECAT_ENJOYCARDS_API_KEY }}
+          echo ""
+          echo "=== Build Completed ==="
+
+      - name: ✅ Verify AAB exists
+        working-directory: ./source-code/enjoycards_app
+        run: |
+          echo "=== AAB File List ==="
+          ls -la build/app/outputs/bundle/release/
+          echo ""
+          echo "=== File Size ==="
+          du -h build/app/outputs/bundle/release/*.aab
+          echo ""
+
+          AAB_PATH=$(find build/app/outputs/bundle/release -name "app-release.aab" -type f)
+          if [ -f "$AAB_PATH" ]; then
+            echo "✅ AAB found: $AAB_PATH"
+          else
+            echo "❌ AAB not found!"
+            exit 1
+          fi
+
+      - name: 🔍 Verify AAB Permissions (BILLING)
+        working-directory: ./source-code/enjoycards_app
+        run: |
+          echo "=== Checking AAB Permissions ==="
+          AAB_PATH=$(find build/app/outputs/bundle/release -name "app-release.aab" -type f)
+
+          echo "Checking $AAB_PATH ..."
+          # Extract base module manifest from AAB (AAB is a zip file)
+          echo "Extracting AndroidManifest from AAB..."
+          unzip -p "$AAB_PATH" "base/manifest/AndroidManifest.xml" > /tmp/base_manifest.xml
+
+          # Search for BILLING permission in binary XML
+          if strings /tmp/base_manifest.xml | grep -q "com.android.vending.BILLING"; then
+            echo "✅ Permission check passed: com.android.vending.BILLING found"
+            echo "All permissions found:"
+            strings /tmp/base_manifest.xml | grep "android.permission"
+          else
+            echo "❌ Permission check FAILED: com.android.vending.BILLING missing"
+            echo "All permissions in manifest:"
+            strings /tmp/base_manifest.xml | grep "android.permission"
+            exit 1
+          fi
+
+      - name: 📦 Upload AAB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: enjoycards-prod-aab
+          path: ./source-code/enjoycards_app/build/app/outputs/bundle/release/*.aab
+          if-no-files-found: error
+
+      - name: 🔑 Decode Google Play Service Account Key
+        run: |
+          echo "${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_KEY_BASE64 }}" | base64 -d > /tmp/google-play-key.json
+
+      - name: 📤 Upload to Google Play
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJson: /tmp/google-play-key.json
+          packageName: com.enjoycards.app
+          releaseFiles: ./source-code/enjoycards_app/build/app/outputs/bundle/release/app-release.aab
+          tracks: ${{ github.event.inputs.track }}
+          status: completed
+
+      - name: 🧹 Cleanup sensitive files
+        if: always()
+        run: |
+          rm -f ./source-code/enjoycards_app/android/key.properties
+          rm -f ./source-code/enjoycards_app/android/app/keys/enjoycards-release.jks
+          rm -f /tmp/google-play-key.json
+          echo "✅ Cleanup completed"
+
+      - name: 📊 Build Result Report
+        run: |
+          echo "========================================"
+          echo "🎉 EnjoyCards Android Release Build Complete"
+          echo "========================================"
+          echo "Status: ✅ Success"
+          echo "Runner: ${{ runner.os }}"
+          echo "Flutter: $(flutter --version | head -1)"
+          echo "Java: $(java -version 2>&1 | head -1)"
+          echo "Track: ${{ github.event.inputs.track }}"
+          echo "========================================"
+          echo "AAB uploaded to Google Play (com.enjoycards.app)"
+          echo "Release Notes: ${{ github.event.inputs.release_notes }}"
+          echo "========================================"
+          echo "Next Steps:"
+          echo "1. Verify build in Google Play Console"
+          echo "2. Promote to desired track"
+          echo "3. Monitor rollout progress"
+          echo "========================================"
+
+  notify:
+    needs: build-apk
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify success
+        if: needs.build-apk.result == 'success'
+        run: |
+          MESSAGE="✅ EnjoyCards Android Production Build Succeeded
+
+          App: com.enjoycards.app
+          Track: ${{ github.event.inputs.track }}
+          Commit: ${{ github.sha }}
+          Branch: ${{ github.ref_name }}
+          Release Notes: ${{ github.event.inputs.release_notes }}
+
+          View: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          jq -n --arg content "$MESSAGE" '{
+            msgtype: "text",
+            text: { content: $content }
+          }' > /tmp/wechat_msg.json
+          curl -s -X POST "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=${{ secrets.WECHAT_WORK_WEBHOOK_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d @/tmp/wechat_msg.json
+
+      - name: Notify failure
+        if: needs.build-apk.result == 'failure'
+        run: |
+          MESSAGE="❌ EnjoyCards Android Production Build FAILED
+
+          App: com.enjoycards.app
+          Track: ${{ github.event.inputs.track }}
+          Commit: ${{ github.sha }}
+          Branch: ${{ github.ref_name }}
+
+          Check: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          jq -n --arg content "$MESSAGE" '{
+            msgtype: "text",
+            text: { content: $content }
+          }' > /tmp/wechat_msg.json
+          curl -s -X POST "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=${{ secrets.WECHAT_WORK_WEBHOOK_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d @/tmp/wechat_msg.json
