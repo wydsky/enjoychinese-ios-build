@@ -203,7 +203,12 @@ jobs:
       - name: 📄 导入发布Provisioning Profile（EnjoyCards）
         run: |
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-          echo "${{ secrets.PROV_ENJOYCARDS_RELEASE_BASE64 }}" | base64 -d > ~/Library/MobileDevice/Provisioning\ Profiles/prod_enjoycards.mobileprovision
+          # 用 printf '%s' 而非 echo，避免换行吞并/转义污染导致 base64 解码出非法字节损坏 mobileprovision
+          # 环境变量经 env: 注入，避免内联 ${{ secrets }} 被 shell 转义或 masked
+          printf '%s' "$PROV_ENJOYCARDS_RELEASE_BASE64" | base64 -d > ~/Library/MobileDevice/Provisioning\ Profiles/prod_enjoycards.mobileprovision
+          echo "导入完成，文件大小：$(stat -f %z ~/Library/MobileDevice/Provisioning\ Profiles/prod_enjoycards.mobileprovision) 字节"
+        env:
+          PROV_ENJOYCARDS_RELEASE_BASE64: ${{ secrets.PROV_ENJOYCARDS_RELEASE_BASE64 }}
 
       - name: 🔍 验证 Provisioning Profile 内容
         run: |
@@ -358,7 +363,7 @@ jobs:
             --release \
             --dart-define=ENV=prod \
             --dart-define=PROD_API_HOST=${{ secrets.PROD_API_HOST }} \
-            --dart-define=REVENUECAT_API_KEY=${{ secrets.REVENUECAT_ENJOYCARDS_API_KEY }} \
+            --dart-define=REVENUECAT_API_KEY=${{ secrets.REVENUECAT_ENJOYCARDS_KEY_IOS }} \
             --export-options-plist=ios/ExportOptions.plist
           echo ""
           echo "=== IPA 构建完成 ==="

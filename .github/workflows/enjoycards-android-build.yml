@@ -227,7 +227,7 @@ jobs:
             --release \
             --dart-define=ENV=prod \
             --dart-define=PROD_API_HOST=${{ secrets.PROD_API_HOST }} \
-            --dart-define=REVENUECAT_API_KEY=${{ secrets.REVENUECAT_ENJOYCARDS_API_KEY }}
+            --dart-define=REVENUECAT_API_KEY=${{ secrets.REVENUECAT_ENJOYCARDS_KEY_ANDROID }}
           echo ""
           echo "=== Build Completed ==="
 
