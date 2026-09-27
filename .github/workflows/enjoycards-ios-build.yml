@@ -207,6 +207,11 @@ jobs:
           # 环境变量经 env: 注入，避免内联 ${{ secrets }} 被 shell 转义或 masked
           printf '%s' "$PROV_ENJOYCARDS_RELEASE_BASE64" | base64 -d > ~/Library/MobileDevice/Provisioning\ Profiles/prod_enjoycards.mobileprovision
           echo "导入完成，文件大小：$(stat -f %z ~/Library/MobileDevice/Provisioning\ Profiles/prod_enjoycards.mobileprovision) 字节"
+          echo "=== 解码产物完整性检查 ==="
+          PROV=~/Library/MobileDevice/Provisioning\ Profiles/prod_enjoycards.mobileprovision
+          # 合法 mobileprovision 是 CMS/PKCS7 二进制，绝非纯文本；首字节不应出现 0xC2 等 UTF-8 引导字节
+          file "$PROV"
+          xxd -l 32 "$PROV"
         env:
           PROV_ENJOYCARDS_RELEASE_BASE64: ${{ secrets.PROV_ENJOYCARDS_RELEASE_BASE64 }}
 
