@@ -219,9 +219,14 @@ jobs:
         run: |
           PROFILE_PATH=~/Library/MobileDevice/Provisioning\ Profiles/prod_enjoycards.mobileprovision
           echo "=== Provisioning Profile 信息 ==="
-          # macOS 26 的 security cms -D 输出 plist 中 cert <data> 常为裸二进制，
-          # PlistBuddy 严格解析会报 "invalid character 0xC2"，故改用 python plistlib 解析
-          security cms -D -i "$PROFILE_PATH" > /tmp/profile.plist
+          # macOS 26 的 security cms -D 会把证书链 <data> 输出为裸二进制，导致 plist 违反 XML 语法
+          # （PlistBuddy 报 0xC2，python plistlib 报 not well-formed），换解析库无效。
+          # 正确做法：用 openssl smime 直接抽取 CMS 内嵌的原始 plist 内容（证书保持 base64），
+          # 得到合法 XML，再由 python plistlib 解析。
+          openssl smime -inform DER -verify -noverify -in "$PROFILE_PATH" -out /tmp/profile.plist 2>/dev/null || {
+            echo "❌ openssl 抽取 profile plist 内容失败"
+            exit 1
+          }
           python3 - <<'PY'
           import plistlib, sys
           with open('/tmp/profile.plist','rb') as f:
