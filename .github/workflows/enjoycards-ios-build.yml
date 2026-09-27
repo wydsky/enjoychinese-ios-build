@@ -219,41 +219,44 @@ jobs:
         run: |
           PROFILE_PATH=~/Library/MobileDevice/Provisioning\ Profiles/prod_enjoycards.mobileprovision
           echo "=== Provisioning Profile 信息 ==="
-          # macOS 26 的 security cms -D 会把证书链 <data> 输出为裸二进制，导致 plist 违反 XML 语法
-          # （PlistBuddy 报 0xC2，python plistlib 报 not well-formed），换解析库无效。
-          # 正确做法：用 openssl smime 直接抽取 CMS 内嵌的原始 plist 内容（证书保持 base64），
-          # 得到合法 XML，再由 python plistlib 解析。
-          openssl smime -inform DER -verify -noverify -in "$PROFILE_PATH" -out /tmp/profile.plist 2>/dev/null || {
-            echo "❌ openssl 抽取 profile plist 内容失败"
+          # 与 ios-build.yml 保持一致：security cms -D 输出 plist 后直接交给 PlistBuddy 读取。
+          # PlistBuddy 使用宽松解析，能容忍 cert <data> 中的非严格 XML；尽量避免 python
+          # plistlib / openssl 严格校验在 macos-26 上因裸二进制 data 而报 not well-formed。
+          security cms -D -i "$PROFILE_PATH" > /tmp/profile.plist
+
+          PROFILE_NAME=$(/usr/libexec/PlistBuddy -c "Print :Name" /tmp/profile.plist)
+          APP_ID=$(/usr/libexec/PlistBuddy -c "Print :Entitlements:application-identifier" /tmp/profile.plist)
+          ERR=''
+          [ -z "$PROFILE_NAME" ] && ERR="Name"
+          [ -z "$APP_ID" ] && ERR="$ERR application-identifier"
+          if [ -n "$ERR" ]; then
+            echo "❌ 无法读取 Profile 字段: $ERR"
             exit 1
-          }
-          python3 - <<'PY'
-          import plistlib, sys
-          with open('/tmp/profile.plist','rb') as f:
-              d = plistlib.load(f)
-              name = d.get('Name', '')
-              ent = d.get('Entitlements', {}) or {}
-              app_id = ent.get('application-identifier', '')
-              expire = d.get('ExpirationDate', '')
-              print('Name:', name)
-              print('App ID:', app_id)
-              print('Expires:', expire)
-              print('')
-              # 校验 bundle id
-              if app_id.endswith('com.enjoycards.app'):
-                  print('✅ Profile 绑定 com.enjoycards.app')
-              else:
-                  print('❌ Profile App ID 不匹配:', app_id, '(期望包含 com.enjoycards.app)')
-                  sys.exit(1)
-              # IAP 为 App Store 隐式默认
-              print('ℹ️  In-App Purchase is an implicit default for App Store distribution')
-              # Apple Pay 不应存在
-              if 'com.apple.developer.in-app-payments' in ent:
-                  print('❌ Profile 包含 Apple Pay 能力 - 不应该存在')
-                  sys.exit(1)
-              else:
-                  print('✅ Profile 不含 Apple Pay 能力')
-          PY
+          fi
+          echo "Name: $PROFILE_NAME"
+          echo "App ID: $APP_ID"
+          echo "Expires: $(/usr/libexec/PlistBuddy -c "Print :ExpirationDate" /tmp/profile.plist)"
+          echo ""
+          echo "=== Entitlements 检查 ==="
+
+          # 校验 bundle id
+          if [[ "$APP_ID" == *"com.enjoycards.app" ]]; then
+            echo "✅ Profile 绑定 com.enjoycards.app"
+          else
+            echo "❌ Profile App ID 不匹配: $APP_ID (期望包含 com.enjoycards.app)"
+            exit 1
+          fi
+
+          # IAP is implicit for App Store distribution, not explicitly listed
+          echo "ℹ️  In-App Purchase is an implicit default for App Store distribution"
+
+          # Check for Apple Pay (should NOT be present)
+          if /usr/libexec/PlistBuddy -c "Print :Entitlements:com.apple.developer.in-app-payments" /tmp/profile.plist 2>/dev/null; then
+            echo "❌ Profile 包含 com.apple.developer.in-app-payments (Apple Pay) - 不应该存在"
+            exit 1
+          else
+            echo "✅ Profile 不含 Apple Pay 能力"
+          fi
 
       - name: 📝 生成导出配置（发布模式）
         working-directory: ./source-code/enjoycards_app/ios
