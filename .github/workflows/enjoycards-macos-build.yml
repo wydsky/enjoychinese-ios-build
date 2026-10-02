@@ -185,7 +185,7 @@ jobs:
           PROFILE_PATH=~/Library/MobileDevice/Provisioning\ Profiles/enjoycards_macos.provisionprofile
           security cms -D -i "$PROFILE_PATH" > /tmp/profile.plist
           PROFILE_NAME=$(/usr/libexec/PlistBuddy -c "Print :Name" /tmp/profile.plist)
-          APP_ID=$(/usr/libexec/PlistBuddy -c "Print :Entitlements:application-identifier" /tmp/profile.plist)
+          APP_ID=$(/usr/libexec/PlistBuddy -c "Print :Entitlements:com.apple.application-identifier" /tmp/profile.plist)
           echo "Profile Name: $PROFILE_NAME"
           echo "App ID: $APP_ID"
           if [[ "$APP_ID" == *"com.enjoycards.app" ]]; then
