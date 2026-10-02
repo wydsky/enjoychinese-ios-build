@@ -166,12 +166,22 @@ jobs:
 
       - name: 🔑 导入 3rd Party Mac Developer Installer 证书（签名 macOS pkg 必需）
         if: ${{ env.P12_MAC_INSTALLER_BASE64 != '' }}
-        uses: apple-actions/import-codesign-certs@v2
-        with:
-          p12-file-base64: ${{ secrets.P12_MAC_INSTALLER_BASE64 }}
-          p12-password: ${{ secrets.P12_MAC_INSTALLER_PASSWORD }}
+        run: |
+          set -e
+          # 上一步 import-codesign-certs@v2 已创建并设为默认的 signing_temp.keychain，
+          # 直接复用该keychain导入，避免重复 create-keychain 报 exit 48。
+          KEYCHAIN=$(security default-keychain | tr -d '"' | tr -d ' ')
+          echo "默认 keychain: $KEYCHAIN"
+          printf '%s' "$P12_MAC_INSTALLER_BASE64" | base64 -d > /tmp/mac_installer.p12
+          security import /tmp/mac_installer.p12 \
+            -k "$KEYCHAIN" \
+            -P "$P12_MAC_INSTALLER_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/productbuild
+          rm -f /tmp/mac_installer.p12
+          echo "✅ Installer 证书导入完成"
         env:
           P12_MAC_INSTALLER_BASE64: ${{ secrets.P12_MAC_INSTALLER_BASE64 }}
+          P12_MAC_INSTALLER_PASSWORD: ${{ secrets.P12_MAC_INSTALLER_PASSWORD }}
 
       - name: ✅ 验证证书导入是否成功
         run: |
