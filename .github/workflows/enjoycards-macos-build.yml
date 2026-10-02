@@ -164,6 +164,13 @@ jobs:
           p12-file-base64: ${{ secrets.P12_RELEASE_BASE64 }}
           p12-password: ${{ secrets.P12_RELEASE_PASSWORD }}
 
+      - name: 🔑 导入 3rd Party Mac Developer Installer 证书（签名 macOS pkg 必需）
+        if: ${{ secrets.P12_MAC_INSTALLER_BASE64 != '' }}
+        uses: apple-actions/import-codesign-certs@v2
+        with:
+          p12-file-base64: ${{ secrets.P12_MAC_INSTALLER_BASE64 }}
+          p12-password: ${{ secrets.P12_MAC_INSTALLER_PASSWORD }}
+
       - name: ✅ 验证证书导入是否成功
         run: |
           echo "=== 已安装的签名证书 ==="
@@ -260,15 +267,22 @@ jobs:
           codesign --verify --deep --strict "$APP_PATH" && echo "✅ 代码签名验证通过"
           codesign -dv --verbose=4 "$APP_PATH" 2>&1 | grep -E "Identifier|TeamIdentifier|flags|Authority" | head
           echo ""
-          echo "=== Entitlements（沙箱+联网） ==="
+          echo "=== Entitlements（沙箱+联网，App Store 必需） ==="
           codesign -d --entitlements - --xml "$APP_PATH" 2>/dev/null > /tmp/macos_entitlements.plist || true
+          SAND_MISSING=false
           for key in com.apple.security.app-sandbox com.apple.security.network.client; do
             if grep -q "$key" /tmp/macos_entitlements.plist 2>/dev/null; then
               echo "✅ 包含 $key"
             else
-              echo "⚠️  缺少 $key（可能影响功能）"
+              echo "❌ 缺少 $key（Mac App Store 上架必需）"
+              SAND_MISSING=true
             fi
           done
+          if [ "$SAND_MISSING" = "true" ]; then
+            echo "❌ Entitlements 未正确嵌入，Mac App Store 会拒绝上传（90296）。"
+            echo "确认 Runner Release target 已设 CODE_SIGN_ENTITLEMENTS=Runner/Release.entitlements 且签名开启了该文件。"
+            exit 1
+          fi
 
       - name: � 上传到 App Store Connect / TestFlight（Mac App Store）
         working-directory: ./source-code/enjoycards_app
@@ -277,11 +291,18 @@ jobs:
           RELEASE_DIR="build/macos/release"
           mkdir -p "$RELEASE_DIR"
           # Mac App Store 不接受直接上传 .app 目录（报 90268/90259/90270/90267），
-          # 需先用 productbuild 打成 .pkg，再通过 altool --type macos 上传。
+          # 需先用 productbuild 打成 .pkg（必须用 3rd Party Mac Developer Installer 证书签名，否则报 90237），
+          # 再通过 altool --type macos 上传。
           PKG_PATH="$RELEASE_DIR/enjoycards_app-$(date +%Y%m%d-%H%M%S).pkg"
-          echo "=== 生成 Mac App Store 安装包（productbuild） ==="
+          echo "=== 生成 Mac App Store 安装包（productbuild，Installer 证书签名） ==="
           echo "将打包: $APP_PATH"
-          productbuild --component "$APP_PATH" /Applications "$PKG_PATH"
+          INSTALLER_CERT=$(security find-identity -v -p codesigning | grep "3rd Party Mac Developer Installer" | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ -z "$INSTALLER_CERT" ]; then
+            echo "❌ 未找到 3rd Party Mac Developer Installer 证书，无法签名 pkg"
+            exit 1
+          fi
+          echo "使用 Installer 证书: $INSTALLER_CERT"
+          productbuild --component "$APP_PATH" /Applications --sign "$INSTALLER_CERT" "$PKG_PATH"
           echo "已生成 pkg: $PKG_PATH ($(du -h "$PKG_PATH" | cut -f1))"
           echo ""
           echo "=== 上传 pkg 至 App Store Connect / TestFlight（Mac App Store） ==="
