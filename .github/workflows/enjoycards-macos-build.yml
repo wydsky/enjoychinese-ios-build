@@ -165,11 +165,13 @@ jobs:
           p12-password: ${{ secrets.P12_RELEASE_PASSWORD }}
 
       - name: 🔑 导入 3rd Party Mac Developer Installer 证书（签名 macOS pkg 必需）
-        if: ${{ secrets.P12_MAC_INSTALLER_BASE64 != '' }}
+        if: ${{ env.P12_MAC_INSTALLER_BASE64 != '' }}
         uses: apple-actions/import-codesign-certs@v2
         with:
           p12-file-base64: ${{ secrets.P12_MAC_INSTALLER_BASE64 }}
           p12-password: ${{ secrets.P12_MAC_INSTALLER_PASSWORD }}
+        env:
+          P12_MAC_INSTALLER_BASE64: ${{ secrets.P12_MAC_INSTALLER_BASE64 }}
 
       - name: ✅ 验证证书导入是否成功
         run: |
