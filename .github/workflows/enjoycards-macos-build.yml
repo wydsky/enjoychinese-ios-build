@@ -308,7 +308,7 @@ jobs:
           PKG_PATH="$RELEASE_DIR/enjoycards_app-$(date +%Y%m%d-%H%M%S).pkg"
           echo "=== 生成 Mac App Store 安装包（productbuild，Installer 证书签名） ==="
           echo "将打包: $APP_PATH"
-          INSTALLER_CERT=$(security find-identity -v -p codesigning | grep "3rd Party Mac Developer Installer" | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          INSTALLER_CERT=$(security find-identity -v | grep "3rd Party Mac Developer Installer" | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
           if [ -z "$INSTALLER_CERT" ]; then
             echo "❌ 未找到 3rd Party Mac Developer Installer 证书，无法签名 pkg"
             exit 1
