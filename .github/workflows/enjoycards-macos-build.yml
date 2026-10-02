@@ -274,10 +274,19 @@ jobs:
         working-directory: ./source-code/enjoycards_app
         run: |
           APP_PATH="build/macos/Build/Products/Release/enjoycards_app.app"
-          echo "上传 macOS App: $APP_PATH"
-          # Mac App Store 走 altool --type macos（需利用 existing ASC 的 macOS 平台记录 com.enjoycards.app）
+          RELEASE_DIR="build/macos/release"
+          mkdir -p "$RELEASE_DIR"
+          # Mac App Store 不接受直接上传 .app 目录（报 90268/90259/90270/90267），
+          # 需先用 productbuild 打成 .pkg，再通过 altool --type macos 上传。
+          PKG_PATH="$RELEASE_DIR/enjoycards_app-$(date +%Y%m%d-%H%M%S).pkg"
+          echo "=== 生成 Mac App Store 安装包（productbuild） ==="
+          echo "将打包: $APP_PATH"
+          productbuild --component "$APP_PATH" /Applications "$PKG_PATH"
+          echo "已生成 pkg: $PKG_PATH ($(du -h "$PKG_PATH" | cut -f1))"
+          echo ""
+          echo "=== 上传 pkg 至 App Store Connect / TestFlight（Mac App Store） ==="
           xcrun altool --upload-app \
-            --file "$APP_PATH" \
+            --file "$PKG_PATH" \
             --type macos \
             --username "${{ secrets.APPLE_ID }}" \
             --password "${{ secrets.APP_STORE_CONNECT_PASSWORD }}"
