@@ -319,12 +319,6 @@ jobs:
           # 再通过 altool --type macos 上传。
           PKG_PATH="$RELEASE_DIR/enjoycards_app-$(date +%Y%m%d-%H%M%S).pkg"
           echo "=== 生成 Mac App Store 安装包（productbuild，Installer 证书签名） ==="
-          # ── 诊断 start ──
-          echo "=== [诊断] 已导入的签名证书 identity 列表（全部） ==="
-          security find-identity -v
-          echo "=== [诊断] 含 installer 的 identity： ==="
-          security find-identity -v | grep -i "installer" || echo "(未匹配到含 installer 的 identity)"
-          # ── 诊断 end ──
           echo "将打包: $APP_PATH"
           INSTALLER_CERT=$(security find-identity -v | grep "3rd Party Mac Developer Installer" | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
           if [ -z "$INSTALLER_CERT" ]; then
