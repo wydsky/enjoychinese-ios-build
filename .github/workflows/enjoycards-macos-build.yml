@@ -170,11 +170,16 @@ jobs:
           set -e
           echo "=== [诊断] P12_MAC_INSTALLER_BASE64 长度: ${#P12_MAC_INSTALLER_BASE64} ==="
           echo "=== [诊断] P12_MAC_INSTALLER_PASSWORD 长度: ${#P12_MAC_INSTALLER_PASSWORD} ==="
-          KEYCHAIN=$(security default-keychain | tr -d '"' | tr -d ' ')
-          echo "默认 keychain: $KEYCHAIN"
+          # 关键：导入到和 Apple Distribution 相同的 signing_temp.keychain（上一步 import-codesign-certs@v2 创建并设为默认）；
+          # 不能导入 login.keychain，否则无法被后续签名/productbuild 枚举到 identity。
+          KEYCHAIN="$HOME/Library/Keychains/signing_temp.keychain-db"
+          echo "目标 keychain: $KEYCHAIN"
+          if [ ! -f "$KEYCHAIN" ]; then
+            echo "⚠️ signing_temp.keychain 不存在，回退用默认 keychain"
+            KEYCHAIN=$(security default-keychain | tr -d '"' | tr -d ' ')
+          fi
           printf '%s' "$P12_MAC_INSTALLER_BASE64" | base64 -d > /tmp/mac_installer.p12
           echo "=== [诊断] p12 导出字节数: $(stat -f %z /tmp/mac_installer.p12) ==="
-          # 导入前先看 keychain 现有 identity（确认该步骤确实在此刻运行）
           echo "=== [诊断] 导入前全部 identity： ==="
           security find-identity -v || true
           security import /tmp/mac_installer.p12 \
