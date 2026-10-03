@@ -158,46 +158,46 @@ jobs:
         working-directory: ./source-code/enjoycards_app
         run: dart run build_runner build --delete-conflicting-outputs
 
-      - name: 🔑 导入Apple Distribution签名证书（iOS与macOS App Store通用）
-        uses: apple-actions/import-codesign-certs@v2
-        with:
-          p12-file-base64: ${{ secrets.P12_RELEASE_BASE64 }}
-          p12-password: ${{ secrets.P12_RELEASE_PASSWORD }}
-
-      - name: 🔑 导入 3rd Party Mac Developer Installer 证书（签名 macOS pkg 必需）
-        if: ${{ env.P12_MAC_INSTALLER_BASE64 != '' }}
+      - name: 🔑 签名证书导入（Apple Distribution + Mac Installer，手动建库+ACL）
+        # 手动统管而非 import-codesign-certs@v2：其内部生成的 keychain 密码我们拿不到，
+        # 无法对 Installer 证书补 set-partition-list 的 ACL，导致它进库却不成 valid identity。
         run: |
           set -e
-          echo "=== [诊断] P12_MAC_INSTALLER_BASE64 长度: ${#P12_MAC_INSTALLER_BASE64} ==="
-          echo "=== [诊断] P12_MAC_INSTALLER_PASSWORD 长度: ${#P12_MAC_INSTALLER_PASSWORD} ==="
-          # 关键：导入到和 Apple Distribution 相同的 signing_temp.keychain（上一步 import-codesign-certs@v2 创建并设为默认）；
-          # 不能导入 login.keychain，否则无法被后续签名/productbuild 枚举到 identity。
-          KEYCHAIN="$HOME/Library/Keychains/signing_temp.keychain-db"
-          echo "目标 keychain: $KEYCHAIN"
-          if [ ! -f "$KEYCHAIN" ]; then
-            echo "⚠️ signing_temp.keychain 不存在，回退用默认 keychain"
-            KEYCHAIN=$(security default-keychain | tr -d '"' | tr -d ' ')
-          fi
-          printf '%s' "$P12_MAC_INSTALLER_BASE64" | base64 -d > /tmp/mac_installer.p12
-          echo "=== [诊断] p12 导出字节数: $(stat -f %z /tmp/mac_installer.p12) ==="
-          echo "=== [诊断] 导入前全部 identity： ==="
-          security find-identity -v || true
-          security import /tmp/mac_installer.p12 \
-            -k "$KEYCHAIN" \
-            -P "$P12_MAC_INSTALLER_PASSWORD" \
-            -T /usr/bin/codesign -T /usr/bin/productbuild
-          echo "=== [诊断] 导入后全部 identity： ==="
-          security find-identity -v || true
-          rm -f /tmp/mac_installer.p12
-          echo "✅ Installer 证书导入完成"
+          KEYCHAIN_NAME="signing_temp.keychain"
+          KEYCHAIN_FILE="$HOME/Library/Keychains/$KEYCHAIN_NAME"
+          KEYCHAIN_PW="$(uuidgen)"
+
+          echo "=== 创建签名 keychain ==="
+          rm -f "$KEYCHAIN_FILE"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN_FILE"
+          security set-keychain-settings "$KEYCHAIN_FILE"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN_FILE"
+
+          # 同时导入两张证书
+          printf '%s' "$P12_RELEASE_BASE64" | base64 -d > /tmp/p12_dist.p12
+          printf '%s' "$P12_MAC_INSTALLER_BASE64" | base64 -d > /tmp/p12_installer.p12
+
+          echo "=== 导入 Apple Distribution ==="
+          security import /tmp/p12_dist.p12 -k "$KEYCHAIN_FILE" -P "$P12_RELEASE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/productbuild
+
+          echo "=== 导入 Mac Installer ==="
+          security import /tmp/p12_installer.p12 -k "$KEYCHAIN_FILE" -P "$P12_MAC_INSTALLER_PASSWORD" -T /usr/bin/codesign -T /usr/bin/productbuild
+
+          # 关键：设置 ACL/partition-list，让 codesign/productbuild 能读取证书私钥，否则不成 valid identity
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PW" "$KEYCHAIN_FILE"
+
+          # 设为默认，供后续 find-identity / codesign / productbuild 使用
+          security list-keychains -d user -s "$KEYCHAIN_FILE" "$HOME/Library/Keychains/login.keychain-db"
+          security default-keychain -s "$KEYCHAIN_FILE"
+
+          echo "=== [诊断] 导入后全部 valid identities ==="
+          security find-identity -v
+
+          rm -f /tmp/p12_dist.p12 /tmp/p12_installer.p12
         env:
+          P12_RELEASE_BASE64: ${{ secrets.P12_RELEASE_BASE64 }}
           P12_MAC_INSTALLER_BASE64: ${{ secrets.P12_MAC_INSTALLER_BASE64 }}
           P12_MAC_INSTALLER_PASSWORD: ${{ secrets.P12_MAC_INSTALLER_PASSWORD }}
-
-      - name: ✅ 验证证书导入是否成功
-        run: |
-          echo "=== 已安装的签名证书 ==="
-          security find-identity -v -p codesigning
 
       - name: 📄 导入Mac App Store Provisioning Profile（EnjoyCards macOS）
         run: |
