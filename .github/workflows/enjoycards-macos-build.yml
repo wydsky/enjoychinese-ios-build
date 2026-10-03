@@ -196,6 +196,7 @@ jobs:
           rm -f /tmp/p12_dist.p12 /tmp/p12_installer.p12
         env:
           P12_RELEASE_BASE64: ${{ secrets.P12_RELEASE_BASE64 }}
+          P12_RELEASE_PASSWORD: ${{ secrets.P12_RELEASE_PASSWORD }}
           P12_MAC_INSTALLER_BASE64: ${{ secrets.P12_MAC_INSTALLER_BASE64 }}
           P12_MAC_INSTALLER_PASSWORD: ${{ secrets.P12_MAC_INSTALLER_PASSWORD }}
 
