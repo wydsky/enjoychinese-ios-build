@@ -243,16 +243,35 @@ jobs:
           # 官方 7-Zip 发行包只附带 7z.sfx（GUI）与 7zCon.sfx（控制台）。
           # 7zSD.sfx / 7zS.sfx 来自外部 7z_extra 包，且其 InstallPath/GUIMode 等键不属于官方格式，
           # 因此这里只用官方模块 + 官方支持的配置键。优先 GUI 版（有进度与标题），缺失时退回控制台版。
-          $sfxDir = Split-Path $sevenZip
-          $sfxModule = Join-Path $sfxDir '7z.sfx'
-          if (-not (Test-Path $sfxModule)) {
-            $consoleSfx = Join-Path $sfxDir '7zCon.sfx'
-            if (Test-Path $consoleSfx) {
-              Write-Host "⚠️  未找到 7z.sfx，退回使用控制台版 7zCon.sfx"
-              $sfxModule = $consoleSfx
-            } else {
-              throw "未找到 7z.sfx / 7zCon.sfx，无法生成自解压包"
+          #
+          # 注意：PATH 命中的往往是 Chocolatey 的 shim（如 C:\ProgramData\Chocolatey\bin\7z.exe），
+          # 该目录并不包含 SFX 模块，必须回到 7-Zip 的实际安装目录查找，否则会误报“未找到 SFX”。
+          $sfxDirs = @(
+            (Split-Path $sevenZip)
+            "$env:ProgramFiles\7-Zip"
+            "${env:ProgramFiles(x86)}\7-Zip"
+          ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
+
+          $sfxModule = $null
+          foreach ($name in @('7z.sfx', '7zCon.sfx')) {
+            $hit = $sfxDirs |
+              ForEach-Object { Join-Path $_ $name } |
+              Where-Object { Test-Path $_ } |
+              Select-Object -First 1
+            if ($hit) {
+              if ($name -eq '7zCon.sfx') {
+                Write-Host "⚠️  未找到 7z.sfx，退回使用控制台版 7zCon.sfx"
+              }
+              $sfxModule = $hit
+              break
             }
+          }
+          # 兜底：choco 的便携/安装包可能把完整 7-Zip（含 SFX 模块）放在 lib 目录下
+          if (-not $sfxModule -and (Test-Path 'C:\ProgramData\chocolatey\lib')) {
+            $sfxModule = Get-ChildItem 'C:\ProgramData\chocolatey\lib' -Recurse -Include '7z.sfx', '7zCon.sfx' -File -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $sfxModule) {
+            throw "未找到 7z.sfx / 7zCon.sfx，无法生成自解压包（已查找: $($sfxDirs -join ', ')）"
           }
           Write-Host "SFX 模块: $sfxModule"
 
