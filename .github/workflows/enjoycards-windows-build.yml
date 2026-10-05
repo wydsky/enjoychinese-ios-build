@@ -1,0 +1,462 @@
+name: EnjoyCards Windows Store Build & Publish (MSIX)
+
+# 用途：构建 EnjoyCards Windows 桌面版并打包为 Microsoft Store 上架所需的 MSIX，
+#       可选地自动提交到 Partner Center（默认只上传为草稿，需人工在 Partner Center 确认后发布）。
+#
+# 与 enjoycards-windows-portable-build.yml 的分工：
+#   - 本文件                        → Microsoft Store 上架用的 MSIX（由 Store 重新签名）
+#   - enjoycards-windows-portable-build.yml → 官网直接下载用的便携版（7-Zip SFX 单文件 EXE）
+# 两者共用同一份 Flutter 代码，但各自维护独立的版本 tracking 文件（互不干扰）。
+#
+# ⚠️ 运行前必须先在仓库配置好下列 Settings（账号下来后再填）：
+#   仓库 Variables（Settings → Secrets and variables → Actions → Variables）：
+#     MSIX_DISPLAY_NAME            应用显示名（可选，默认 EnjoyCards）
+#     MSIX_IDENTITY_NAME           Partner Center → Product identity 的 Identity Name
+#     MSIX_PUBLISHER               Partner Center → Product identity 的 Publisher（形如 CN=xxxxxxxx-....）
+#     MSIX_PUBLISHER_DISPLAY_NAME  Partner Center → Product identity 的 Publisher display name
+#     MSIX_STORE_APP_ID            Partner Center 中的应用 ID（仅自动提交时需要）
+#   仓库 Secrets：
+#     AZURE_AD_TENANT_ID / SELLER_ID / AZURE_AD_APPLICATION_CLIENT_ID / AZURE_AD_APPLICATION_SECRET
+#     （仅自动提交时需要，来自 Partner Center 关联的 Entra 租户应用）
+#
+# ⚠️ 已知限制：msstore CLI 目前只支持「免费产品」的自动提交。EnjoyCards 含订阅，
+#    自动提交可能不被支持；此时请下载 Artifact 中的 .msix，在 Partner Center 手动提交。
+
+on:
+  workflow_dispatch:
+    inputs:
+      store_submit:
+        description: '是否构建后自动提交 MSIX 到 Microsoft Store（仅上传为草稿，需在 Partner Center 确认后发布）'
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      release_notes:
+        description: 'Release notes（仅用于构建报告，不会自动写入 Store 提交）'
+        required: false
+        default: 'Bug fixes and performance improvements'
+
+# 与便携版 workflow 共用同一串行组：两者都会自增并推送同一分支的 pubspec.yaml，
+# 并发手动触发会产生 non-fast-forward 冲突，这里让它们排队执行。
+concurrency:
+  group: enjoycards-windows-build
+  cancel-in-progress: false
+
+jobs:
+  build-msix:
+    runs-on: windows-latest
+    name: 构建EnjoyCards MSIX并（可选）发布至Microsoft Store
+    permissions:
+      contents: write
+    steps:
+      - name: 📋 Checkout 当前打包仓库
+        uses: actions/checkout@v4
+
+      - name: 📥 拉取私有Gitee Flutter代码
+        shell: bash
+        run: |
+          git clone -b client-release https://oauth2:${{ secrets.GITEE_TOKEN }}@gitee.com/yunhaninfo/enjoy-chinese.git source-code
+          cd source-code
+
+      - name: 🔢 Manage Windows Store Build Version
+        working-directory: ./source-code
+        shell: bash
+        run: |
+          set -e
+          echo "========================================"
+          echo "🔢 Managing EnjoyCards Windows Store Build Version"
+          echo "========================================"
+
+          CURRENT_VERSION=$(grep "^version:" enjoycards_app/pubspec.yaml | sed 's/version: *//' | tr -d ' ')
+          VERSION_NAME=$(echo "$CURRENT_VERSION" | cut -d+ -f1)
+          BUILD_NUMBER=$(echo "$CURRENT_VERSION" | cut -d+ -f2)
+          echo "Current version: $CURRENT_VERSION"
+          echo "  Version name: $VERSION_NAME"
+          echo "  Build number: $BUILD_NUMBER"
+
+          VERSION_TRACK_FILE=".github/deploy/version-enjoycards-windows-store.txt"
+          VERSION_FILE="$GITHUB_WORKSPACE/$VERSION_TRACK_FILE"
+          if [ -f "$VERSION_FILE" ]; then
+            STORED_BUILD=$(cat "$VERSION_FILE" | tr -d ' \n')
+          else
+            STORED_BUILD="0"
+            echo "ℹ️  Version tracking file not found, initializing to 0"
+          fi
+          echo "Stored build number: $STORED_BUILD"
+
+          NEW_BUILD=$BUILD_NUMBER
+          if [ "$BUILD_NUMBER" -le "$STORED_BUILD" ] 2>/dev/null; then
+            NEW_BUILD=$((STORED_BUILD + 1))
+            NEW_VERSION="${VERSION_NAME}+${NEW_BUILD}"
+            echo "⬆️  Auto-incrementing: $CURRENT_VERSION → $NEW_VERSION"
+            sed -i "s/^version: .*/version: ${NEW_VERSION}/" enjoycards_app/pubspec.yaml
+            echo "✅ Updated pubspec.yaml to version: $NEW_VERSION"
+            UPDATED_VERSION="$NEW_VERSION"
+          else
+            UPDATED_VERSION="$CURRENT_VERSION"
+            echo "🔁 Syncing tracking file: pubspec.yaml ($BUILD_NUMBER) > stored ($STORED_BUILD)"
+          fi
+
+          mkdir -p "$(dirname "$VERSION_FILE")"
+          echo "$NEW_BUILD" > "$VERSION_FILE"
+          echo "✅ Updated version tracking file: $NEW_BUILD (previously: $STORED_BUILD)"
+
+          echo ""
+          echo "=== Committing to Gitee ==="
+          git config user.name "jenkins-cicd"
+          git config user.email "jenkins@enjoychinese.app"
+          git add enjoycards_app/pubspec.yaml
+          if git diff --cached --quiet; then
+            echo "ℹ️  No pubspec.yaml changes to commit to Gitee"
+          else
+            git commit -m "chore: auto-increment EnjoyCards Windows store build version to $UPDATED_VERSION [skip ci]"
+            REMOTE_URL="https://oauth2:${GITEE_TOKEN}@gitee.com/yunhaninfo/enjoy-chinese.git"
+            git push "$REMOTE_URL" HEAD:client-release
+            echo "✅ Successfully pushed to Gitee"
+          fi
+
+          echo ""
+          echo "=== Committing to deploy repo ==="
+          COMMIT_MSG="chore: update EnjoyCards Windows store build version tracking to $NEW_BUILD [skip ci]"
+          ENCODED_CONTENT=$(echo -n "$NEW_BUILD" | base64 -w 0)
+          API_URL="https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/${VERSION_TRACK_FILE}"
+          HTTP_CODE=$(curl -s -o /tmp/api_response.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${GH_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            "$API_URL")
+          if [ "$HTTP_CODE" = "200" ]; then
+            # 用 jq 取 sha：本步骤下方已依赖 jq，避免额外引入 python3（windows runner 上只有 python）
+            FILE_SHA=$(jq -r '.sha' /tmp/api_response.json)
+            JSON_BODY=$(jq -n \
+              --arg msg "$COMMIT_MSG" \
+              --arg content "$ENCODED_CONTENT" \
+              --arg sha "$FILE_SHA" \
+              '{message: $msg, content: $content, sha: $sha}')
+          else
+            JSON_BODY=$(jq -n \
+              --arg msg "$COMMIT_MSG" \
+              --arg content "$ENCODED_CONTENT" \
+              '{message: $msg, content: $content}')
+          fi
+          UPDATE_CODE=$(curl -s -o /tmp/update_response.json -w "%{http_code}" \
+            -X PUT \
+            -H "Authorization: Bearer ${GH_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            -d "$JSON_BODY" \
+            "$API_URL")
+          if [ "$UPDATE_CODE" = "200" ] || [ "$UPDATE_CODE" = "201" ]; then
+            echo "✅ Successfully updated deploy repo via GitHub API"
+          else
+            echo "❌ Failed to update deploy repo (HTTP $UPDATE_CODE)"
+            cat /tmp/update_response.json
+            exit 1
+          fi
+          echo "========================================"
+          echo "✅ Version Management Complete: $UPDATED_VERSION"
+          echo "========================================"
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+
+      - name: 🚀 配置 Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.2'
+          channel: stable
+
+      - name: 💾 缓存依赖
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/AppData/Local/Pub/Cache
+            ./source-code/enjoycards_app/.dart_tool
+            ./source-code/enjoycards_app/build/windows
+          key: ${{ runner.os }}-enjoycards-windows-store-flutter-${{ hashFiles('source-code/enjoycards_app/pubspec.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-enjoycards-windows-store-flutter-
+
+      - name: 📦 安装项目依赖
+        working-directory: ./source-code/enjoycards_app
+        run: flutter pub get
+
+      - name: 🏗️ 生成代码（json_serializable等）
+        working-directory: ./source-code/enjoycards_app
+        run: dart run build_runner build --delete-conflicting-outputs
+
+      - name: 🧩 安装 MSIX 打包工具（msix）
+        working-directory: ./source-code/enjoycards_app
+        run: |
+          # 以 dev 依赖临时安装，不改动仓库中的 pubspec（pubspec.lock 也不回写仓库）
+          flutter pub add --dev msix
+
+      - name: 🔎 计算 MSIX 版本号并写入 msix_config
+        id: msixcfg
+        working-directory: ./source-code/enjoycards_app
+        shell: pwsh
+        env:
+          MSIX_DISPLAY_NAME: ${{ vars.MSIX_DISPLAY_NAME }}
+          MSIX_IDENTITY_NAME: ${{ vars.MSIX_IDENTITY_NAME }}
+          MSIX_PUBLISHER: ${{ vars.MSIX_PUBLISHER }}
+          MSIX_PUBLISHER_DISPLAY_NAME: ${{ vars.MSIX_PUBLISHER_DISPLAY_NAME }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # 1) 校验 Partner Center 账号配置（缺一个都无法生成可上架的 MSIX）
+          #    用 GetEnvironmentVariable 而非 Get-Item env: —— 变量未配置时返回 $null 而不是抛异常
+          $missing = @()
+          foreach ($name in @('MSIX_IDENTITY_NAME', 'MSIX_PUBLISHER', 'MSIX_PUBLISHER_DISPLAY_NAME')) {
+            if ([string]::IsNullOrWhiteSpace([System.Environment]::GetEnvironmentVariable($name))) {
+              $missing += $name
+            }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Host "❌ 缺少仓库 Variables：$($missing -join ', ')"
+            Write-Host ""
+            Write-Host "请在 GitHub → Settings → Secrets and variables → Actions → Variables 中添加："
+            Write-Host "  MSIX_DISPLAY_NAME            （可选）应用显示名，默认 EnjoyCards"
+            Write-Host "  MSIX_IDENTITY_NAME           Partner Center → Product identity → Package/Identity/Name"
+            Write-Host "  MSIX_PUBLISHER               Partner Center → Product identity → Package/Identity/Publisher（形如 CN=xxxx-xxxx-...）"
+            Write-Host "  MSIX_PUBLISHER_DISPLAY_NAME  Partner Center → Product identity → Package/Properties/PublisherDisplayName"
+            Write-Host ""
+            Write-Host "这些值必须与 Partner Center 中登记的完全一致，否则 Store 提交会被拒绝。"
+            exit 1
+          }
+
+          $displayName          = if ([string]::IsNullOrWhiteSpace($env:MSIX_DISPLAY_NAME)) { 'EnjoyCards' } else { $env:MSIX_DISPLAY_NAME }
+          $identityName         = $env:MSIX_IDENTITY_NAME.Trim()
+          $publisher            = $env:MSIX_PUBLISHER.Trim()
+          $publisherDisplayName = $env:MSIX_PUBLISHER_DISPLAY_NAME.Trim()
+
+          # 2) 版本号：Store 要求四段式 Major.Minor.Build.Revision，且第 4 段必须为 0
+          #    （见 https://learn.microsoft.com/en-us/windows/apps/publish/publish-your-app/msix/app-package-requirements#package-version-numbering）
+          #    pubspec 的 1.0.0+34 → 1.0.34.0（把 build number 放到第 3 段，避免被 Store 拒绝）
+          $rawVersion = (Select-String -Path 'pubspec.yaml' -Pattern '^version:\s*(.+)' |
+                         Select-Object -First 1).Matches[0].Groups[1].Value.Trim()
+          $segments = $rawVersion -split '\+'
+          $versionName = $segments[0].Trim()
+          $buildNumber = if ($segments.Count -gt 1) { [int]$segments[1].Trim() } else { 0 }
+          $nums = $versionName.Split('.')
+          $major = [int]$nums[0]
+          $minor = if ($nums.Count -gt 1) { [int]$nums[1] } else { 0 }
+          $third = if ($buildNumber -gt 0) { $buildNumber } else { if ($nums.Count -gt 2) { [int]$nums[2] } else { 0 } }
+          $msixVersion = "$major.$minor.$third.0"
+          Write-Host "pubspec version: $rawVersion  →  MSIX version: $msixVersion"
+
+          # 3) 把 msix_config 写入 pubspec.yaml（仅本地构建时追加，不提交回仓库，
+          #    避免把账号相关的 Identity Name / Publisher 写进代码库）
+          $pubspec = Get-Content -Path 'pubspec.yaml' -Raw
+          if ($pubspec -match '(?m)^msix_config:') {
+            Write-Host "ℹ️  pubspec.yaml 已含 msix_config，跳过追加"
+          } else {
+            # 值用 YAML 单引号包裹，避免 CN 串里的特殊字符破坏 YAML
+            $lines = @(
+              ''
+              'msix_config:'
+              "  display_name: '$($displayName.Replace("'", "''"))'"
+              "  publisher_display_name: '$($publisherDisplayName.Replace("'", "''"))'"
+              "  identity_name: '$($identityName.Replace("'", "''"))'"
+              "  publisher: '$($publisher.Replace("'", "''"))'"
+              "  msix_version: $msixVersion"
+              '  logo_path: assets/images/logo.png'
+              '  capabilities: internetClient'
+              '  architecture: x64'
+              '  output_path: build/windows/msix'
+              '  store: true'
+              '  sign_msix: false'
+            )
+            Add-Content -Path 'pubspec.yaml' -Value ($lines -join "`n") -Encoding utf8
+            Write-Host "✅ 已追加 msix_config："
+            $lines | ForEach-Object { Write-Host "  $_" }
+          }
+
+          "msix_version=$msixVersion" >> $env:GITHUB_OUTPUT
+
+      - name: 🔨 编译 Windows Release
+        working-directory: ./source-code/enjoycards_app
+        shell: bash
+        run: |
+          echo "=== 开始构建 EnjoyCards Windows 桌面版 ==="
+          # 说明：不注入 REVENUECAT_API_KEY —— RevenueCat 在 Windows 上未启用
+          # （见 lib/services/revenuecat_service.dart: Platform.isIOS/MacOS/Android 之外直接 return）
+          flutter build windows \
+            --release \
+            --dart-define=ENV=prod \
+            --dart-define=PROD_API_HOST=${{ secrets.PROD_API_HOST }}
+          echo ""
+          echo "=== Windows 构建完成 ==="
+
+      - name: ✅ 校验产物（定位 Release 目录）
+        id: locate
+        working-directory: ./source-code/enjoycards_app
+        shell: pwsh
+        run: |
+          # Flutter 3.10+ 输出在 build/windows/x64/runner/Release；旧版在 build/windows/runner/Release。
+          # 这里按文件名反查，避免因 Flutter 版本差异导致路径写死而失败。
+          $exe = Get-ChildItem -Path 'build/windows' -Recurse -Filter 'enjoycards_app.exe' -File -ErrorAction SilentlyContinue |
+                 Where-Object { $_.DirectoryName -match 'Release' } |
+                 Select-Object -First 1
+          if (-not $exe) {
+            Write-Host "❌ 未找到 enjoycards_app.exe，build/windows 目录内容："
+            if (Test-Path 'build/windows') { Get-ChildItem -Path 'build/windows' -Recurse -Depth 3 | Select-Object FullName }
+            exit 1
+          }
+          $releaseDir = $exe.DirectoryName
+          Write-Host "✅ Release 目录: $releaseDir"
+          Write-Host "=== 目录内容（前 40 项）==="
+          Get-ChildItem -Path $releaseDir | Select-Object -First 40 Name, Length
+          Write-Host "=== 目录总大小 ==="
+          $sizeMb = [math]::Round(((Get-ChildItem $releaseDir -Recurse -File | Measure-Object Length -Sum).Sum / 1MB), 1)
+          Write-Host "$sizeMb MB"
+
+          # 关键文件必须在，否则 MSIX 装出来无法启动
+          foreach ($required in @('enjoycards_app.exe', 'flutter_windows.dll', 'data')) {
+            if (Test-Path (Join-Path $releaseDir $required)) {
+              Write-Host "✅ 包含 $required"
+            } else {
+              Write-Host "❌ 缺少 $required —— MSIX 安装后会无法运行"
+              exit 1
+            }
+          }
+
+          "release_dir=$releaseDir" >> $env:GITHUB_OUTPUT
+
+      - name: 📦 生成 MSIX 包
+        working-directory: ./source-code/enjoycards_app
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          dart run msix:create
+          if ($LASTEXITCODE -ne 0) { throw "msix:create 失败，退出码 $LASTEXITCODE" }
+          Write-Host "=== build/windows/msix 目录 ==="
+          Get-ChildItem -Path 'build/windows/msix' -Recurse -File | Select-Object Name, Length
+
+      - name: 🔍 校验 MSIX（解包检查 AppxManifest）
+        id: verify
+        working-directory: ./source-code/enjoycards_app
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $msix = Get-ChildItem -Path 'build/windows/msix' -Filter '*.msix' -File -ErrorAction SilentlyContinue |
+                  Select-Object -First 1
+          if (-not $msix) { throw "未找到 .msix 产物，请检查上一步 msix:create 输出" }
+          $sizeMb = [math]::Round($msix.Length / 1MB, 1)
+          Write-Host "✅ MSIX: $($msix.Name) ($sizeMb MB)"
+
+          # msix 就是 zip：解包后读取 AppxManifest.xml，确认 Identity 与预期一致
+          $tmp = Join-Path $env:RUNNER_TEMP 'msix-inspect'
+          Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+          $zip = Join-Path $tmp 'package.zip'
+          Copy-Item $msix.FullName $zip
+          Expand-Archive -Path $zip -DestinationPath (Join-Path $tmp 'x') -Force
+
+          [xml]$doc = Get-Content (Join-Path $tmp 'x\AppxManifest.xml') -Raw
+          # 用 local-name() 做命名空间无关的查询，避免依赖 AppxManifest 的命名空间前缀
+          $identity = $doc.SelectSingleNode("/*[local-name()='Package']/*[local-name()='Identity']")
+          if (-not $identity) { throw '未在 AppxManifest.xml 中找到 Identity 节点' }
+
+          $name         = $identity.GetAttribute('Name')
+          $publisherVal = $identity.GetAttribute('Publisher')
+          $version      = $identity.GetAttribute('Version')
+          $arch         = $identity.GetAttribute('ProcessorArchitecture')
+          Write-Host "=== AppxManifest Identity ==="
+          Write-Host "  Name:        $name"
+          Write-Host "  Publisher:   $publisherVal"
+          Write-Host "  Version:     $version"
+          Write-Host "  Arch:        $arch"
+
+          # 与 Partner Center 登记的 Identity 比对（store: true 时必须完全一致）
+          if ($name -ne "${{ vars.MSIX_IDENTITY_NAME }}".Trim()) {
+            Write-Host "❌ Identity Name 与仓库 Variable MSIX_IDENTITY_NAME 不一致"
+            exit 1
+          }
+          if ($publisherVal -ne "${{ vars.MSIX_PUBLISHER }}".Trim()) {
+            Write-Host "❌ Publisher 与仓库 Variable MSIX_PUBLISHER 不一致"
+            exit 1
+          }
+
+          # Store 硬性要求：版本第 4 段必须为 0
+          if ($version -notmatch '^\d+\.\d+\.\d+\.0$') {
+            Write-Host "❌ MSIX 版本 $version 不符合 Store 要求（必须为 Major.Minor.Build.0，第 4 段为 0）"
+            exit 1
+          }
+          Write-Host "✅ 版本号符合 Store 四段式规则"
+
+          # 检查联网能力（否则应用无法访问后端 API）
+          $caps = @($doc.SelectNodes("//*[local-name()='Capability']") | ForEach-Object { $_.GetAttribute('Name') })
+          Write-Host "=== Capabilities ==="
+          Write-Host "  $($caps -join ', ')"
+          if ($caps -notcontains 'internetClient') {
+            Write-Host "❌ 缺少 internetClient 能力，应用将无法访问后端 API"
+            exit 1
+          }
+
+          "msix_path=$($msix.FullName)"  >> $env:GITHUB_OUTPUT
+          "msix_name=$($msix.Name)"      >> $env:GITHUB_OUTPUT
+          "msix_size=$($msix.Length)"    >> $env:GITHUB_OUTPUT
+
+      - name: 🛠️ 安装 Microsoft Store CLI
+        if: ${{ github.event.inputs.store_submit == 'true' }}
+        uses: microsoft/setup-msstore-cli@v1
+
+      - name: 🚀 提交 MSIX 到 Microsoft Store（上传为草稿）
+        if: ${{ github.event.inputs.store_submit == 'true' }}
+        working-directory: ./source-code/enjoycards_app
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if ([string]::IsNullOrWhiteSpace("${{ vars.MSIX_STORE_APP_ID }}")) {
+            throw "缺少仓库 Variable MSIX_STORE_APP_ID（Partner Center 中的应用 ID），无法自动提交"
+          }
+
+          # Partner Center 关联的 Entra 应用凭据（在 Partner Center → Account settings → User management 中
+          # 需为该应用授予 Manager 角色，否则 reconfigure 会报权限错误）
+          msstore reconfigure `
+            --tenantId "${{ secrets.AZURE_AD_TENANT_ID }}" `
+            --sellerId "${{ secrets.SELLER_ID }}" `
+            --clientId "${{ secrets.AZURE_AD_APPLICATION_CLIENT_ID }}" `
+            --clientSecret "${{ secrets.AZURE_AD_APPLICATION_SECRET }}"
+
+          # -nc/--noCommit：只上传为草稿，不直接提交审核；请在 Partner Center 确认包内容后再手动完成提交。
+          # 若需要直接提交，去掉 -nc 即可。
+          msstore publish -i "build/windows/msix" -id "${{ vars.MSIX_STORE_APP_ID }}" -nc
+
+      - name: 📦 上传Artifact（MSIX，供手动提交 Partner Center）
+        uses: actions/upload-artifact@v4
+        with:
+          name: enjoycards-prod-windows-store-msix
+          path: ./source-code/enjoycards_app/build/windows/msix/*.msix
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: 📊 构建结果报告
+        id: report
+        shell: bash
+        run: |
+          echo "========================================"
+          echo "🎉 EnjoyCards Windows Store 包（MSIX）构建完成"
+          echo "========================================"
+          echo "状态: ✅ 成功"
+          echo "Runner: ${{ runner.os }}"
+          echo "Flutter: $(flutter --version | head -1)"
+          echo ""
+          echo "MSIX 版本: ${{ steps.msixcfg.outputs.msix_version }}"
+          echo "文件名:    ${{ steps.verify.outputs.msix_name }}"
+          echo "文件大小:  ${{ steps.verify.outputs.msix_size }} 字节"
+          echo "Release Notes: ${{ github.event.inputs.release_notes }}"
+          echo ""
+          echo "Artifact: enjoycards-prod-windows-store-msix"
+          echo "自动提交: ${{ github.event.inputs.store_submit }}（true 时仅上传为草稿，需到 Partner Center 确认后发布）"
+          echo "========================================"
+          echo "后续步骤（若未自动提交或自动提交不可用）："
+          echo "1. 下载 Artifact 中的 .msix"
+          echo "2. 打开 https://partner.microsoft.com/dashboard → 你的应用 → 提交新版本"
+          echo "3. 上传 .msix（Store 会重新签名，本地无需证书）"
+          echo "4. 填写版本号与 Release Notes，提交审核"
+          echo "========================================"

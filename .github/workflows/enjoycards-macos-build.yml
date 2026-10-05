@@ -147,8 +147,12 @@ jobs:
         with:
           path: |
             ~/.pub-cache
+            ~/Library/Caches/CocoaPods
             ./source-code/enjoycards_app/.dart_tool
+            ./source-code/enjoycards_app/build/macos/SourcePackages
           key: ${{ runner.os }}-enjoycards-macos-flutter-${{ hashFiles('source-code/enjoycards_app/pubspec.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-enjoycards-macos-flutter-
 
       - name: 📦 安装项目依赖
         working-directory: ./source-code/enjoycards_app
@@ -308,7 +312,7 @@ jobs:
             exit 1
           fi
 
-      - name: � 上传到 App Store Connect / TestFlight（Mac App Store）
+      - name: 📤 上传到 App Store Connect / TestFlight（Mac App Store）
         working-directory: ./source-code/enjoycards_app
         run: |
           APP_PATH="build/macos/Build/Products/Release/enjoycards_app.app"
@@ -345,7 +349,7 @@ jobs:
           ditto -c -k --rsrc --keepParent "$APP_PATH" "$RELEASE_DIR/enjoycards_app.app.zip"
           echo "已生成 zip: $RELEASE_DIR/enjoycards_app.app.zip ($(du -h "$RELEASE_DIR/enjoycards_app.app.zip" | cut -f1))"
 
-      - name: � 上传Artifact
+      - name: 📦 上传Artifact
         uses: actions/upload-artifact@v4
         with:
           name: enjoycards-prod-macos
