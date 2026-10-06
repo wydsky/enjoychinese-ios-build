@@ -1,12 +1,12 @@
-name: EnjoyCards Windows Portable Build (官网下载 · 单文件自解压 EXE)
+name: EnjoyCards Windows Portable Build (官网下载 · Inno Setup 安装包)
 
-# 用途：构建 EnjoyCards Windows 桌面版，打包成「单文件自解压 EXE」并作为 Artifact 提供下载。
-# 该 EXE 由你下载后手动上传到官网/发布服务器，并在后端登记版本（app_version 表
-# package_name = com.enjoycards.app.windows），官网的 /js/download.js 会据此展示版本、
-# 文件大小与 SHA-256。
+# 用途：构建 EnjoyCards Windows 桌面版，用 Inno Setup 打包成「带安装向导的安装包」并作为
+# Artifact 提供下载。该安装包由你下载后手动上传到官网/发布服务器，并在后端登记版本
+# （app_version 表 package_name = com.enjoycards.app.windows），官网的 /js/download.js
+# 会据此展示版本、文件大小与 SHA-256。
 #
 # 与 enjoycards-windows-build.yml 的分工：
-#   - 本文件          → 官网直接下载用的便携版（7-Zip SFX 单文件 EXE）
+#   - 本文件          → 官网直接下载用的 Inno Setup 安装包（安装向导/快捷方式/卸载入口）
 #   - enjoycards-windows-build.yml → Microsoft Store 上架用的 MSIX
 # 两者共用同一份 Flutter 代码，但各自维护独立的版本 tracking 文件（互不干扰）。
 
@@ -22,7 +22,7 @@ concurrency:
 jobs:
   build-windows-portable:
     runs-on: windows-latest
-    name: 构建EnjoyCards Windows便携版（单文件自解压EXE，供官网下载）
+    name: 构建EnjoyCards Windows便携版（Inno Setup 安装包，供官网下载）
     permissions:
       contents: write
     steps:
@@ -211,7 +211,7 @@ jobs:
 
           "release_dir=$releaseDir" >> $env:GITHUB_OUTPUT
 
-      - name: 📦 打包为单文件自解压 EXE（7-Zip SFX）
+      - name: 📦 打包为安装包（Inno Setup）
         id: package
         working-directory: ./source-code/enjoycards_app
         shell: pwsh
@@ -227,112 +227,93 @@ jobs:
           New-Item -ItemType Directory -Force -Path $outDir | Out-Null
           $exeName = "EnjoyCards-Setup-$versionName.exe"
           $outExe  = Join-Path $outDir $exeName
-          $archive = Join-Path $outDir 'app.7z'
-          $config  = Join-Path $outDir 'sfx-config.txt'
+          $issPath = Join-Path $outDir 'enjoycards.iss'
 
-          # 1) 定位 7-Zip（runner 镜像预装；不硬编码路径，先查 PATH 再查默认安装目录）
-          $sevenZip = (Get-Command 7z.exe -ErrorAction SilentlyContinue).Source
-          if (-not $sevenZip) {
-            foreach ($p in @("$env:ProgramFiles\7-Zip\7z.exe", "${env:ProgramFiles(x86)}\7-Zip\7z.exe")) {
-              if (Test-Path $p) { $sevenZip = $p; break }
+          # 1) 定位 Inno Setup 编译器（runner 镜像预装；先查 PATH 再查默认安装目录，最后 choco 兜底）
+          $iscc = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) {
+            foreach ($p in @(
+              "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
+              "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+              "$env:ProgramFiles\Inno Setup 5\ISCC.exe",
+              "${env:ProgramFiles(x86)}\Inno Setup 5\ISCC.exe"
+            )) {
+              if (Test-Path $p) { $iscc = $p; break }
             }
           }
-          if (-not $sevenZip) { throw '未找到 7z.exe，无法打包' }
-          Write-Host "7z: $sevenZip"
-
-          # 官方 7-Zip 发行包只附带 7z.sfx（GUI）与 7zCon.sfx（控制台）。
-          # 7zSD.sfx / 7zS.sfx 来自外部 7z_extra 包，且其 InstallPath/GUIMode 等键不属于官方格式，
-          # 因此这里只用官方模块 + 官方支持的配置键。优先 GUI 版（有进度与标题），缺失时退回控制台版。
-          #
-          # 注意：PATH 命中的往往是 Chocolatey 的 shim（如 C:\ProgramData\Chocolatey\bin\7z.exe），
-          # 该目录并不包含 SFX 模块，必须回到 7-Zip 的实际安装目录查找，否则会误报“未找到 SFX”。
-          $sfxDirs = @(
-            (Split-Path $sevenZip)
-            "$env:ProgramFiles\7-Zip"
-            "${env:ProgramFiles(x86)}\7-Zip"
-          ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
-
-          $sfxModule = $null
-          foreach ($name in @('7z.sfx', '7zCon.sfx')) {
-            $hit = $sfxDirs |
-              ForEach-Object { Join-Path $_ $name } |
-              Where-Object { Test-Path $_ } |
-              Select-Object -First 1
-            if ($hit) {
-              if ($name -eq '7zCon.sfx') {
-                Write-Host "⚠️  未找到 7z.sfx，退回使用控制台版 7zCon.sfx"
-              }
-              $sfxModule = $hit
-              break
-            }
+          if (-not $iscc -and (Test-Path 'C:\ProgramData\chocolatey\lib')) {
+            $iscc = Get-ChildItem 'C:\ProgramData\chocolatey\lib' -Recurse -Filter 'ISCC.exe' -File -ErrorAction SilentlyContinue |
+                    Select-Object -First 1 -ExpandProperty FullName
           }
-          # 兜底：choco 的便携/安装包可能把完整 7-Zip（含 SFX 模块）放在 lib 目录下
-          if (-not $sfxModule -and (Test-Path 'C:\ProgramData\chocolatey\lib')) {
-            $sfxModule = Get-ChildItem 'C:\ProgramData\chocolatey\lib' -Recurse -Include '7z.sfx', '7zCon.sfx' -File -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
-          }
-          if (-not $sfxModule) {
-            throw "未找到 7z.sfx / 7zCon.sfx，无法生成自解压包（已查找: $($sfxDirs -join ', ')）"
-          }
-          Write-Host "SFX 模块: $sfxModule"
+          if (-not $iscc) { throw '未找到 ISCC.exe（Inno Setup 编译器），无法生成安装包' }
+          Write-Host "ISCC: $iscc"
 
-          # 2) 剔除调试符号，减小体积
+          # 2) 生成 Inno Setup 脚本（安装向导 / 目录选择 / 快捷方式 / 卸载入口 / 装完可自动运行）
+          #    脚本在 CI 内动态生成、不落地到 Flutter 仓库；内容保持纯 ASCII，避免编码问题。
+          $iconPath = Join-Path (Get-Location) 'windows/runner/resources/app_icon.ico'
+          $iconLine = if (Test-Path $iconPath) { "SetupIconFile=$iconPath" } else { '' }
+          $islPath  = Join-Path (Split-Path $iscc) 'Languages\ChineseSimplified.isl'
+          $cnLine   = if (Test-Path $islPath) { 'Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"' } else { '' }
+          $outputBase = $exeName -replace '\.exe$', ''
+
+          $issLines = @(
+            '; generated by CI - do not edit by hand'
+            '[Setup]'
+            'AppId={{8F1D2A54-3C6B-4E7A-9D21-5B0C7E3A1F42}'
+            'AppName=EnjoyCards'
+            "AppVersion=$versionName"
+            'AppPublisher=EnjoyCards'
+            'DefaultDirName={autopf}\EnjoyCards'
+            'DefaultGroupName=EnjoyCards'
+            'DisableProgramGroupPage=yes'
+            'AllowNoIcons=yes'
+            'PrivilegesRequired=lowest'
+            'ArchitecturesInstallIn64BitMode=x64'
+            'Compression=lzma2/max'
+            'SolidCompression=yes'
+            'WizardStyle=modern'
+            'UninstallDisplayName=EnjoyCards'
+            'UninstallDisplayIcon={app}\enjoycards_app.exe'
+            "OutputDir=$outDir"
+            "OutputBaseFilename=$outputBase"
+          )
+          if ($iconLine) { $issLines += $iconLine }
+          $issLines += @(
+            ''
+            '[Languages]'
+            'Name: "english"; MessagesFile: "compiler:Default.isl"'
+          )
+          if ($cnLine) { $issLines += $cnLine }
+          $issLines += @(
+            ''
+            '[Tasks]'
+            'Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: checkedonce'
+            ''
+            '[Files]'
+            "Source: `"$releaseDir\*`"; DestDir: `"{app}`"; Flags: ignoreversion recursesubdirs createallsubdirs"
+            ''
+            '[Icons]'
+            'Name: "{autoprograms}\EnjoyCards"; Filename: "{app}\enjoycards_app.exe"'
+            'Name: "{autodesktop}\EnjoyCards"; Filename: "{app}\enjoycards_app.exe"; Tasks: desktopicon'
+            ''
+            '[Run]'
+            'Filename: "{app}\enjoycards_app.exe"; Description: "{cm:LaunchProgram,EnjoyCards}"; Flags: nowait postinstall skipifsilent'
+          )
+          [System.IO.File]::WriteAllLines($issPath, $issLines, (New-Object System.Text.UTF8Encoding($true)))
+          Write-Host "Inno Setup 脚本: $issPath"
+
+          # 3) 剔除调试符号，减小体积
           Get-ChildItem -Path $releaseDir -Recurse -Include '*.pdb' -File | Remove-Item -Force -ErrorAction SilentlyContinue
 
-          # 3) 压缩 Release 目录内容（在目录内以 .\* 打包，保证解压根目录就是 exe/dll/data）
-          if (Test-Path $archive) { Remove-Item $archive -Force }
-          Push-Location $releaseDir
-          try {
-            & $sevenZip a -t7z -mx=7 -mmt=on $archive '.\*' | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "7z 压缩失败，退出码 $LASTEXITCODE" }
-          } finally {
-            Pop-Location
-          }
-          Write-Host "已生成压缩包: $archive ($([math]::Round((Get-Item $archive).Length / 1MB, 1)) MB)"
-
-          # 4) 校验压缩包内容（确保 data/ 等资源被打进去）
-          #    注意：$listing 是行数组，PowerShell 的 -notmatch 对数组左值会返回「不匹配的元素集合」，
-          #    在 if 中恒为真；必须先 -join 成单个字符串再匹配。
-          $listingText = (& $sevenZip l $archive) -join "`n"
-          foreach ($need in @('enjoycards_app.exe', 'flutter_windows.dll', 'data\flutter_assets')) {
-            if ($listingText -notmatch [regex]::Escape($need)) {
-              throw "压缩包内缺少 $need，应用将无法启动"
-            }
-            Write-Host "✅ 压缩包内含 $need"
-          }
-          Write-Host "✅ 压缩包内容校验通过"
-
-          # 5) 写 SFX 配置（官方格式，必须 UTF-8 无 BOM + CRLF 行尾）
-          #    可用键仅：Title / BeginPrompt / Progress / RunProgram / Directory / ExecuteFile / ExecuteParameters
-          #    RunProgram 为解压完成后要执行的程序，相对解压目录；默认解压到临时目录。
-          $configText = @(
-            ';!@Install@!UTF-8!'
-            'Title="EnjoyCards"'
-            'Progress="yes"'
-            'RunProgram="enjoycards_app.exe"'
-            ';!@InstallEnd@!'
-          ) -join "`r`n"
-          [System.IO.File]::WriteAllText($config, $configText + "`r`n", (New-Object System.Text.UTF8Encoding($false)))
-          Write-Host "SFX 配置:"
-          Get-Content $config | ForEach-Object { Write-Host "  $_" }
-
-          # 6) 拼接 7z.sfx + config + archive → 单个自解压 exe
-          #    用 .NET 流式拼接而非 copy /b，避免路径含空格/命令过长的问题
-          if (Test-Path $outExe) { Remove-Item $outExe -Force }
-          $outStream = [System.IO.File]::Create($outExe)
-          try {
-            foreach ($part in @($sfxModule, $config, $archive)) {
-              $in = [System.IO.File]::OpenRead($part)
-              try { $in.CopyTo($outStream) } finally { $in.Dispose() }
-            }
-          } finally {
-            $outStream.Dispose()
-          }
-          Remove-Item $archive, $config -Force -ErrorAction SilentlyContinue
+          # 4) 编译安装包（ISCC 按脚本把 Release 目录整体打进安装包）
+          & $iscc $issPath
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup 编译失败，退出码 $LASTEXITCODE" }
+          if (-not (Test-Path $outExe)) { throw "未生成安装包: $outExe" }
 
           $exeSize = (Get-Item $outExe).Length
-          Write-Host "✅ 已生成单文件自解压 EXE: $outExe ($([math]::Round($exeSize / 1MB, 1)) MB)"
+          Write-Host "✅ 已生成安装包: $outExe ($([math]::Round($exeSize / 1MB, 1)) MB)"
 
-          # 7) 生成 SHA-256 校验文件（官网展示的 checksum 用这个值登记）
+          # 5) 生成 SHA-256 校验文件（官网展示的 checksum 用这个值登记）
           $hash = (Get-FileHash -Algorithm SHA256 $outExe).Hash.ToLower()
           Set-Content -Path "$outExe.sha256" -Value "$hash  $exeName" -Encoding ascii -NoNewline
           Write-Host "✅ SHA-256: $hash"
@@ -355,7 +336,7 @@ jobs:
         shell: bash
         run: |
           echo "========================================"
-          echo "🎉 EnjoyCards Windows 便携版（自解压 EXE）构建完成"
+          echo "🎉 EnjoyCards Windows 便携版（Inno Setup 安装包）构建完成"
           echo "========================================"
           echo "状态: ✅ 成功"
           echo "Runner: ${{ runner.os }}"
