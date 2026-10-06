@@ -104,55 +104,11 @@ jobs:
           NEW_BUILD=$((STORED_BUILD + 1))
           echo "⬆️  Auto-incrementing: $STORED_BUILD → $NEW_BUILD"
 
-          mkdir -p "$(dirname "$VERSION_FILE")"
-          echo "$NEW_BUILD" > "$VERSION_FILE"
-          echo "✅ Updated version tracking file: $NEW_BUILD (previously: $STORED_BUILD)"
-
+          # 延迟写入：这里只计算 N 并透传，不落盘、不提交。
+          # 计数器由后续「📌 结算构建版本号」步骤在产物上传成功后才写入；
+          # 任何阶段失败都不会消耗版本号，因此也无需回滚。
           echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
           echo "build_number=$NEW_BUILD"   >> "$GITHUB_OUTPUT"
-
-          echo ""
-          echo "=== Committing to deploy repo ==="
-          COMMIT_MSG="chore: update EnjoyCards Windows store build version tracking to $NEW_BUILD [skip ci]"
-          ENCODED_CONTENT=$(echo -n "$NEW_BUILD" | base64 -w 0)
-          API_URL="https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/${VERSION_TRACK_FILE}"
-          HTTP_CODE=$(curl -s -o /tmp/api_response.json -w "%{http_code}" \
-            -H "Authorization: Bearer ${GH_PAT}" \
-            -H "Accept: application/vnd.github+json" \
-            "$API_URL")
-          if [ "$HTTP_CODE" = "200" ]; then
-            # 用 jq 取 sha：本步骤下方已依赖 jq，避免额外引入 python3（windows runner 上只有 python）
-            FILE_SHA=$(jq -r '.sha' /tmp/api_response.json)
-            JSON_BODY=$(jq -n \
-              --arg msg "$COMMIT_MSG" \
-              --arg content "$ENCODED_CONTENT" \
-              --arg sha "$FILE_SHA" \
-              '{message: $msg, content: $content, sha: $sha}')
-          else
-            JSON_BODY=$(jq -n \
-              --arg msg "$COMMIT_MSG" \
-              --arg content "$ENCODED_CONTENT" \
-              '{message: $msg, content: $content}')
-          fi
-          UPDATE_CODE=$(curl -s -o /tmp/update_response.json -w "%{http_code}" \
-            -X PUT \
-            -H "Authorization: Bearer ${GH_PAT}" \
-            -H "Accept: application/vnd.github+json" \
-            -H "Content-Type: application/json" \
-            -d "$JSON_BODY" \
-            "$API_URL")
-          if [ "$UPDATE_CODE" = "200" ] || [ "$UPDATE_CODE" = "201" ]; then
-            echo "✅ Successfully updated deploy repo via GitHub API"
-          else
-            echo "❌ Failed to update deploy repo (HTTP $UPDATE_CODE)"
-            cat /tmp/update_response.json
-            exit 1
-          fi
-          echo "========================================"
-          echo "✅ Version Management Complete: ${VERSION_NAME}+${NEW_BUILD}"
-          echo "========================================"
-        env:
-          GH_PAT: ${{ secrets.GH_PAT }}
 
       - name: 🚀 配置 Flutter
         uses: subosito/flutter-action@v2
@@ -423,6 +379,84 @@ jobs:
           path: ./source-code/enjoycards_app/build/windows/msix/*.msix
           if-no-files-found: error
           retention-days: 90
+
+      # 结算紧跟 MSIX 产物上传成功之后（而非 job 末尾）：商店提交步骤可能被跳过（store_submit=false），
+      # 跳过不算失败；只要包已产出并归档即可落盘，避免后续收尾步骤失败导致版本号被回收。
+      - name: 📌 结算构建版本号
+        shell: bash
+        run: |
+          set -e
+          BUILD_NUMBER="${{ steps.ver.outputs.build_number }}"
+          VERSION_TRACK_FILE=".github/deploy/version-enjoycards-windows-store.txt"
+          echo "========================================"
+          echo "📌 结算构建版本号（产物已上传成功）"
+          echo "========================================"
+          echo "待写入计数器: $VERSION_TRACK_FILE = $BUILD_NUMBER"
+
+          COMMIT_MSG="chore: update EnjoyCards Windows store build version tracking to $BUILD_NUMBER [skip ci]"
+          # 用 printf | base64 | tr 而非 base64 -w 0：BSD base64（macOS runner）不支持 -w
+          ENCODED_CONTENT=$(printf '%s' "$BUILD_NUMBER" | base64 | tr -d '\n')
+          API_URL="https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/${VERSION_TRACK_FILE}"
+
+          # 读当前 SHA：文件已存在时 PUT 必须带 sha，否则 GitHub 返回 409
+          FILE_SHA=""
+          HTTP_CODE=$(curl -s -o /tmp/api_response.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${GH_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            "$API_URL")
+          if [ "$HTTP_CODE" = "200" ]; then
+            FILE_SHA=$(jq -r '.sha' /tmp/api_response.json)
+            echo "Existing file SHA: $FILE_SHA"
+          else
+            echo "ℹ️  计数器文件尚不存在（HTTP $HTTP_CODE），将新建"
+          fi
+
+          if [ -n "$FILE_SHA" ]; then
+            JSON_BODY=$(jq -n \
+              --arg msg "$COMMIT_MSG" \
+              --arg content "$ENCODED_CONTENT" \
+              --arg sha "$FILE_SHA" \
+              '{message: $msg, content: $content, sha: $sha}')
+          else
+            JSON_BODY=$(jq -n \
+              --arg msg "$COMMIT_MSG" \
+              --arg content "$ENCODED_CONTENT" \
+              '{message: $msg, content: $content}')
+          fi
+
+          # 重试 3 次：MSIX 已产出，此处失败会让该编号下次被复用，必须尽力成功
+          SUCCESS=0
+          for attempt in 1 2 3; do
+            UPDATE_CODE=$(curl -s -o /tmp/update_response.json -w "%{http_code}" \
+              -X PUT \
+              -H "Authorization: Bearer ${GH_PAT}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Content-Type: application/json" \
+              -d "$JSON_BODY" \
+              "$API_URL")
+            if [ "$UPDATE_CODE" = "200" ] || [ "$UPDATE_CODE" = "201" ]; then
+              SUCCESS=1
+              break
+            fi
+            echo "⚠️  写入失败（第 $attempt 次，HTTP $UPDATE_CODE）"
+            cat /tmp/update_response.json || true
+            sleep $((attempt * 3))
+          done
+
+          if [ "$SUCCESS" != "1" ]; then
+            echo ""
+            echo "❌❌❌ 严重：产物已成功上传，但版本计数器写入失败！"
+            echo "    请立即手动把 $VERSION_TRACK_FILE 的内容改为 $BUILD_NUMBER，"
+            echo "    否则下次构建会复用该版本号。"
+            exit 1
+          fi
+
+          echo ""
+          echo "========================================"
+          echo "✅ Version Management Complete: ${{ steps.ver.outputs.version_name }}+$BUILD_NUMBER"
+          echo "========================================"
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
 
       - name: 📊 构建结果报告
         id: report
