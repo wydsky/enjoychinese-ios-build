@@ -225,6 +225,9 @@ jobs:
 
           $outDir = Join-Path (Get-Location) 'build/windows/site'
           New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+          # build/windows 会被 actions/cache 还原，上一版的安装包与校验文件会被一起带回；
+          # 不清理会导致上传的 artifact 混入多个版本的 exe，官网登记校验值将对不上。
+          Remove-Item -Path (Join-Path $outDir 'EnjoyCards-Setup-*.exe*') -Force -ErrorAction SilentlyContinue
           $exeName = "EnjoyCards-Setup-$versionName.exe"
           $outExe  = Join-Path $outDir $exeName
           $issPath = Join-Path $outDir 'enjoycards.iss'
@@ -313,9 +316,9 @@ jobs:
           $exeSize = (Get-Item $outExe).Length
           Write-Host "✅ 已生成安装包: $outExe ($([math]::Round($exeSize / 1MB, 1)) MB)"
 
-          # 5) 生成 SHA-256 校验文件（官网展示的 checksum 用这个值登记）
+          # 5) 计算 SHA-256（官网展示的 checksum 由后端 app_version.sha256 字段提供，
+          #    不随包分发 .sha256 文件，避免下载包里出现 exe 之外的杂项文件）
           $hash = (Get-FileHash -Algorithm SHA256 $outExe).Hash.ToLower()
-          Set-Content -Path "$outExe.sha256" -Value "$hash  $exeName" -Encoding ascii -NoNewline
           Write-Host "✅ SHA-256: $hash"
 
           "version=$versionName" >> $env:GITHUB_OUTPUT
@@ -327,7 +330,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: enjoycards-prod-windows-portable
-          path: ./source-code/enjoycards_app/build/windows/site/EnjoyCards-Setup-*.exe*
+          # 只上传本次版本的 exe，避免通配符把历史版本一并打包
+          path: ./source-code/enjoycards_app/build/windows/site/${{ steps.package.outputs.exe_name }}
           if-no-files-found: error
           retention-days: 90
 
@@ -349,10 +353,13 @@ jobs:
           echo ""
           echo "Artifact: enjoycards-prod-windows-portable"
           echo "========================================"
+          echo "取件方式（推荐用命令行，不经浏览器，不会触发 Chrome 下载拦截）："
+          echo "  gh run download ${{ github.run_id }} --repo ${{ github.repository }} -n enjoycards-prod-windows-portable -D ./dist"
+          echo "  （gh 会自动解压 artifact，./dist 下直接就是 EnjoyCards-Setup-<version>.exe）"
+          echo ""
           echo "后续手工步骤："
-          echo "1. 下载 Artifact 中的 EnjoyCards-Setup-<version>.exe"
-          echo "2. 上传到官网发布服务器 / CDN"
-          echo "3. 在后端登记版本（package_name = com.enjoycards.app.windows），"
+          echo "1. 上传 ./dist/EnjoyCards-Setup-<version>.exe 到官网发布服务器 / CDN"
+          echo "2. 在后端登记版本（package_name = com.enjoycards.app.windows），"
           echo "   填入上面的文件名、大小与 SHA-256"
-          echo "4. 打开 https://www.enjoycards.app/en/download/ 确认按钮变为可下载状态"
+          echo "3. 打开 https://www.enjoycards.app/en/download/ 确认按钮变为可下载状态"
           echo "========================================"
