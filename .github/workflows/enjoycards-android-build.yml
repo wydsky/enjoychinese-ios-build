@@ -18,6 +18,12 @@ on:
           - beta
           - production
 
+# 同一平台的构建必须串行：并发运行会先后读到同一个计数器值，产生重复的 versionCode 被 Play 拒收。
+# 跨平台之间不再需要互斥 —— 各平台只读写自己的计数器文件。
+concurrency:
+  group: enjoycards-android-build
+  cancel-in-progress: false
+
 jobs:
   build-apk:
     runs-on: ubuntu-latest
@@ -34,6 +40,7 @@ jobs:
           cd source-code
 
       - name: 🔢 Manage Android Build Version
+        id: ver
         working-directory: ./source-code
         run: |
           set -e
@@ -41,15 +48,17 @@ jobs:
           echo "🔢 Managing EnjoyCards Android Build Version"
           echo "========================================"
 
-          # Read current version from pubspec.yaml
-          CURRENT_VERSION=$(grep "^version:" enjoycards_app/pubspec.yaml | sed 's/version: *//' | tr -d ' ')
-          VERSION_NAME=$(echo "$CURRENT_VERSION" | cut -d+ -f1)
-          BUILD_NUMBER=$(echo "$CURRENT_VERSION" | cut -d+ -f2)
-          echo "Current version: $CURRENT_VERSION"
-          echo "  Version name: $VERSION_NAME"
-          echo "  Build number: $BUILD_NUMBER"
+          # 版本名：只取 pubspec `version:` 中 `+` 之前的部分（跨平台统一，人工维护）。
+          # pubspec 的 `+N` 只是本地开发默认值，CI 既不读取也不回写 —— 构建号改由本平台
+          # 独立计数器维护，避免各平台互相推高版本号。
+          VERSION_NAME=$(grep "^version:" enjoycards_app/pubspec.yaml | sed 's/version: *//' | cut -d+ -f1 | tr -d ' ')
+          if [ -z "$VERSION_NAME" ]; then
+            echo "❌ 无法从 pubspec.yaml 解析版本名"
+            exit 1
+          fi
+          echo "Version name: $VERSION_NAME"
 
-          # Read stored version from deploy repo tracking file
+          # 本平台构建号计数器（部署仓库内，只由本 workflow 读写）
           VERSION_TRACK_FILE=".github/deploy/version-enjoycards-android.txt"
           VERSION_FILE="$GITHUB_WORKSPACE/$VERSION_TRACK_FILE"
           if [ -f "$VERSION_FILE" ]; then
@@ -60,43 +69,24 @@ jobs:
           fi
           echo "Stored build number: $STORED_BUILD"
 
-          # Compare and auto-increment if needed
-          NEW_BUILD=$BUILD_NUMBER
-          if [ "$BUILD_NUMBER" -le "$STORED_BUILD" ] 2>/dev/null; then
-            NEW_BUILD=$((STORED_BUILD + 1))
-            NEW_VERSION="${VERSION_NAME}+${NEW_BUILD}"
-            echo "⬆️  Auto-incrementing: $CURRENT_VERSION → $NEW_VERSION"
+          # 内容非法时直接失败，不静默兜底：否则会把版本号重置，并直接撞上商店拒收
+          case "$STORED_BUILD" in
+            ''|*[!0-9]*)
+              echo "❌ 计数器文件内容非法: '$STORED_BUILD'（$VERSION_TRACK_FILE）"
+              exit 1
+              ;;
+          esac
 
-            # Update pubspec.yaml using perl (cross-platform)
-            perl -i -pe "s/^version: .*/version: ${NEW_VERSION}/" enjoycards_app/pubspec.yaml
-            echo "✅ Updated pubspec.yaml to version: $NEW_VERSION"
-            UPDATED_VERSION="$NEW_VERSION"
-          else
-            UPDATED_VERSION="$CURRENT_VERSION"
-            echo "🔁 Syncing tracking file: pubspec.yaml ($BUILD_NUMBER) > stored ($STORED_BUILD)"
-            echo "   → version tracking file will be synced to $BUILD_NUMBER"
-          fi
+          # 独立自增：只看本平台的历史值，与其他平台无关
+          NEW_BUILD=$((STORED_BUILD + 1))
+          echo "⬆️  Auto-incrementing: $STORED_BUILD → $NEW_BUILD"
 
-          # Update version tracking file in deploy repo
           mkdir -p "$(dirname "$VERSION_FILE")"
           echo "$NEW_BUILD" > "$VERSION_FILE"
           echo "✅ Updated version tracking file: $NEW_BUILD (previously: $STORED_BUILD)"
 
-          # Commit pubspec.yaml changes to Gitee
-          echo ""
-          echo "=== Committing to Gitee ==="
-          git config user.name "jenkins-cicd"
-          git config user.email "jenkins@enjoychinese.app"
-          git add enjoycards_app/pubspec.yaml
-
-          if git diff --cached --quiet; then
-            echo "ℹ️  No pubspec.yaml changes to commit to Gitee"
-          else
-            git commit -m "chore: auto-increment EnjoyCards Android build version to $UPDATED_VERSION [skip ci]"
-            REMOTE_URL="https://oauth2:${GITEE_TOKEN}@gitee.com/yunhaninfo/enjoy-chinese.git"
-            git push "$REMOTE_URL" HEAD:client-release
-            echo "✅ Successfully pushed to Gitee"
-          fi
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          echo "build_number=$NEW_BUILD"   >> "$GITHUB_OUTPUT"
 
           # Commit version tracking file to deploy repo (GitHub)
           echo ""
@@ -146,11 +136,9 @@ jobs:
 
           echo ""
           echo "========================================"
-          echo "✅ Version Management Complete: $UPDATED_VERSION"
+          echo "✅ Version Management Complete: ${VERSION_NAME}+${NEW_BUILD}"
           echo "========================================"
         env:
-          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_PAT: ${{ secrets.GH_PAT }}
 
       - name: 🚀 Setup Flutter
@@ -223,8 +211,11 @@ jobs:
         working-directory: ./source-code/enjoycards_app
         run: |
           echo "=== Starting EnjoyCards Android Release Build ==="
+          # versionCode / versionName 由 --build-number 与 pubspec 的版本名共同决定，
+          # 构建号来自本平台独立计数器（见 Manage Android Build Version 步骤）
           flutter build appbundle \
             --release \
+            --build-number=${{ steps.ver.outputs.build_number }} \
             --dart-define=ENV=prod \
             --dart-define=PROD_API_HOST=${{ secrets.PROD_API_HOST }} \
             --dart-define=REVENUECAT_API_KEY=${{ secrets.REVENUECAT_ENJOYCARDS_KEY_ANDROID }}
@@ -248,6 +239,24 @@ jobs:
             echo "❌ AAB not found!"
             exit 1
           fi
+
+          # 断言产物真的带上了本平台计数器号：Flutter 会把 --build-number 写进
+          # android/local.properties 的 flutter.versionCode，AGP 再据此赋给 versionCode。
+          # 这一步用于兜住"--build-number 被忽略/被覆盖"这类静默失效。
+          PROP=./android/local.properties
+          if [ ! -f "$PROP" ]; then
+            echo "❌ 未生成 $PROP，无法校验 versionCode"
+            exit 1
+          fi
+          echo "=== android/local.properties 版本信息 ==="
+          grep -E '^flutter\.(versionName|versionCode)=' "$PROP" || true
+          EXPECTED_CODE="${{ steps.ver.outputs.build_number }}"
+          ACTUAL_CODE=$(grep -E '^flutter\.versionCode=' "$PROP" | head -1 | cut -d= -f2 | tr -d ' \r')
+          if [ "$ACTUAL_CODE" != "$EXPECTED_CODE" ]; then
+            echo "❌ versionCode 与计数器不一致：期望 $EXPECTED_CODE，实际 '$ACTUAL_CODE'"
+            exit 1
+          fi
+          echo "✅ versionCode 已按本平台计数器写入：$ACTUAL_CODE"
 
       - name: 🔍 Verify AAB Permissions (BILLING)
         working-directory: ./source-code/enjoycards_app
@@ -310,12 +319,14 @@ jobs:
           echo "Flutter: $(flutter --version | head -1)"
           echo "Java: $(java -version 2>&1 | head -1)"
           echo "Track: ${{ github.event.inputs.track }}"
+          echo "版本名:    ${{ steps.ver.outputs.version_name }}"
+          echo "构建号:    ${{ steps.ver.outputs.build_number }}（本平台独立计数器，与 iOS/macOS/Windows 无关）"
           echo "========================================"
           echo "AAB uploaded to Google Play (com.enjoycards.app)"
           echo "Release Notes: ${{ github.event.inputs.release_notes }}"
           echo "========================================"
           echo "Next Steps:"
-          echo "1. Verify build in Google Play Console"
+          echo "1. Verify build in Google Play Console（确认 versionCode = ${{ steps.ver.outputs.build_number }}）"
           echo "2. Promote to desired track"
           echo "3. Monitor rollout progress"
           echo "========================================"
