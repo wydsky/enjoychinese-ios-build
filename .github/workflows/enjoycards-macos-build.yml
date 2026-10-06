@@ -3,12 +3,18 @@ name: EnjoyCards macOS Release Build & Upload (Mac App Store)
 on:
   workflow_dispatch:
 
+# 同一平台的构建必须串行：并发运行会先后读到同一个计数器值，产生重复的构建号被 App Store Connect 拒收。
+# 跨平台之间不再需要互斥 —— 各平台只读写自己的计数器文件。
+concurrency:
+  group: enjoycards-macos-build
+  cancel-in-progress: false
+
 jobs:
   build-macos:
     runs-on: macos-26
     name: 构建EnjoyCards macOS App并上传至App Store Connect (Mac App Store)
     permissions:
-      contents: write
+      contents: read
     steps:
       - name: 📋 Checkout 当前打包仓库
         uses: actions/checkout@v4
@@ -37,6 +43,7 @@ jobs:
           cd source-code
 
       - name: 🔢 Manage macOS Build Version
+        id: ver
         working-directory: ./source-code
         run: |
           set -e
@@ -44,13 +51,17 @@ jobs:
           echo "🔢 Managing EnjoyCards macOS Build Version"
           echo "========================================"
 
-          CURRENT_VERSION=$(grep "^version:" enjoycards_app/pubspec.yaml | sed 's/version: *//' | tr -d ' ')
-          VERSION_NAME=$(echo "$CURRENT_VERSION" | cut -d+ -f1)
-          BUILD_NUMBER=$(echo "$CURRENT_VERSION" | cut -d+ -f2)
-          echo "Current version: $CURRENT_VERSION"
-          echo "  Version name: $VERSION_NAME"
-          echo "  Build number: $BUILD_NUMBER"
+          # 版本名：只取 pubspec `version:` 中 `+` 之前的部分（跨平台统一，人工维护）。
+          # pubspec 的 `+N` 只是本地开发默认值，CI 既不读取也不回写 —— 构建号改由本平台
+          # 独立计数器维护，避免各平台互相推高版本号。
+          VERSION_NAME=$(grep "^version:" enjoycards_app/pubspec.yaml | sed 's/version: *//' | cut -d+ -f1 | tr -d ' ')
+          if [ -z "$VERSION_NAME" ]; then
+            echo "❌ 无法从 pubspec.yaml 解析版本名"
+            exit 1
+          fi
+          echo "Version name: $VERSION_NAME"
 
+          # 本平台构建号计数器（部署仓库内，只由本 workflow 读写）
           VERSION_TRACK_FILE=".github/deploy/version-enjoycards-macos.txt"
           VERSION_FILE="$GITHUB_WORKSPACE/$VERSION_TRACK_FILE"
           if [ -f "$VERSION_FILE" ]; then
@@ -61,36 +72,24 @@ jobs:
           fi
           echo "Stored build number: $STORED_BUILD"
 
-          NEW_BUILD=$BUILD_NUMBER
-          if [ "$BUILD_NUMBER" -le "$STORED_BUILD" ] 2>/dev/null; then
-            NEW_BUILD=$((STORED_BUILD + 1))
-            NEW_VERSION="${VERSION_NAME}+${NEW_BUILD}"
-            echo "⬆️  Auto-incrementing: $CURRENT_VERSION → $NEW_VERSION"
-            perl -i -pe "s/^version: .*/version: ${NEW_VERSION}/" enjoycards_app/pubspec.yaml
-            echo "✅ Updated pubspec.yaml to version: $NEW_VERSION"
-            UPDATED_VERSION="$NEW_VERSION"
-          else
-            UPDATED_VERSION="$CURRENT_VERSION"
-            echo "🔁 Syncing tracking file: pubspec.yaml ($BUILD_NUMBER) > stored ($STORED_BUILD)"
-          fi
+          # 内容非法时直接失败，不静默兜底：否则会把版本号重置，并直接撞上商店拒收
+          case "$STORED_BUILD" in
+            ''|*[!0-9]*)
+              echo "❌ 计数器文件内容非法: '$STORED_BUILD'（$VERSION_TRACK_FILE）"
+              exit 1
+              ;;
+          esac
+
+          # 独立自增：只看本平台的历史值，与其他平台无关
+          NEW_BUILD=$((STORED_BUILD + 1))
+          echo "⬆️  Auto-incrementing: $STORED_BUILD → $NEW_BUILD"
 
           mkdir -p "$(dirname "$VERSION_FILE")"
           echo "$NEW_BUILD" > "$VERSION_FILE"
           echo "✅ Updated version tracking file: $NEW_BUILD (previously: $STORED_BUILD)"
 
-          echo ""
-          echo "=== Committing to Gitee ==="
-          git config user.name "jenkins-cicd"
-          git config user.email "jenkins@enjoychinese.app"
-          git add enjoycards_app/pubspec.yaml
-          if git diff --cached --quiet; then
-            echo "ℹ️  No pubspec.yaml changes to commit to Gitee"
-          else
-            git commit -m "chore: auto-increment EnjoyCards macOS build version to $UPDATED_VERSION [skip ci]"
-            REMOTE_URL="https://oauth2:${GITEE_TOKEN}@gitee.com/yunhaninfo/enjoy-chinese.git"
-            git push "$REMOTE_URL" HEAD:client-release
-            echo "✅ Successfully pushed to Gitee"
-          fi
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          echo "build_number=$NEW_BUILD"   >> "$GITHUB_OUTPUT"
 
           echo ""
           echo "=== Committing to deploy repo ==="
@@ -129,11 +128,9 @@ jobs:
             exit 1
           fi
           echo "========================================"
-          echo "✅ Version Management Complete: $UPDATED_VERSION"
+          echo "✅ Version Management Complete: ${VERSION_NAME}+${NEW_BUILD}"
           echo "========================================"
         env:
-          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_PAT: ${{ secrets.GH_PAT }}
 
       - name: 🚀 配置 Flutter
@@ -261,8 +258,11 @@ jobs:
         working-directory: ./source-code/enjoycards_app
         run: |
           echo "=== 开始构建 EnjoyCards macOS App ==="
+          # CFBundleVersion 由 --build-number 决定，构建号来自本平台独立计数器
+          # （见 Manage macOS Build Version 步骤）
           flutter build macos \
             --release \
+            --build-number=${{ steps.ver.outputs.build_number }} \
             --dart-define=ENV=prod \
             --dart-define=PROD_API_HOST=${{ secrets.PROD_API_HOST }} \
             --dart-define=REVENUECAT_API_KEY=${{ secrets.REVENUECAT_ENJOYCARDS_KEY_IOS }}
@@ -290,6 +290,25 @@ jobs:
             echo "❌ Bundle ID 不匹配，期望 com.enjoycards.app"
             exit 1
           fi
+          echo ""
+          echo "=== 内嵌版本号 ==="
+          MAC_INFO="$APP_PATH/Contents/Info.plist"
+          SHORT_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$MAC_INFO")
+          BUILD_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$MAC_INFO")
+          echo "CFBundleShortVersionString: $SHORT_VERSION"
+          echo "CFBundleVersion:            $BUILD_VERSION"
+          # 断言产物真的带上了本平台计数器号，兜住 "--build-number 被忽略/被工程配置覆盖" 这类静默失效
+          EXPECTED_NAME="${{ steps.ver.outputs.version_name }}"
+          EXPECTED_BUILD="${{ steps.ver.outputs.build_number }}"
+          if [ "$BUILD_VERSION" != "$EXPECTED_BUILD" ]; then
+            echo "❌ CFBundleVersion=$BUILD_VERSION，期望 $EXPECTED_BUILD"
+            exit 1
+          fi
+          if [ "$SHORT_VERSION" != "$EXPECTED_NAME" ]; then
+            echo "❌ CFBundleShortVersionString=$SHORT_VERSION，期望 $EXPECTED_NAME"
+            exit 1
+          fi
+          echo "✅ 产物内嵌版本号与计数器一致：$SHORT_VERSION ($BUILD_VERSION)"
           echo ""
           echo "=== 签名验证 ==="
           codesign --verify --deep --strict "$APP_PATH" && echo "✅ 代码签名验证通过"
@@ -365,6 +384,9 @@ jobs:
           echo "Xcode: $(xcodebuild -version | head -1)"
           echo "Flutter: $(flutter --version | head -1)"
           echo "Bundle ID: com.enjoycards.app (iOS/macOS 同记录)"
+          echo ""
+          echo "版本名:    ${{ steps.ver.outputs.version_name }}"
+          echo "构建号:    ${{ steps.ver.outputs.build_number }}（本平台独立计数器，与 Android/iOS/Windows 无关）"
           echo "========================================"
           echo "macOS 上传成功，请前往 App Store Connect 完成提交审核"
           echo "https://appstoreconnect.apple.com/"
