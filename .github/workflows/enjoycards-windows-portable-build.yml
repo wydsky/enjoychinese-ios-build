@@ -116,9 +116,17 @@ jobs:
           echo "=== 开始构建 EnjoyCards Windows 桌面版 ==="
           # 说明：不注入 REVENUECAT_API_KEY —— RevenueCat 在 Windows 上未启用
           # （见 lib/services/revenuecat_service.dart: Platform.isIOS/MacOS/Android 之外直接 return）
+          #
+          # 本平台构建号由独立计数器维护（见 Manage Windows Portable Build Version）。
+          # 构建前把它写进 pubspec 的 `+N`，让 exe 内嵌版本与安装包版本、后端登记
+          # 的 versionCode 同源；否则客户端拿 1.0.2+44 去比后端的计数器值，会永远误判。
+          sed -i "s/^version:.*/version: ${{ steps.ver.outputs.version_name }}+${{ steps.ver.outputs.build_number }}/" pubspec.yaml
+          grep '^version:' pubspec.yaml
+          # DIST_CHANNEL=direct 打开应用内更新（仅官网直装包，MSIX/商店包保持关闭）
           flutter build windows \
             --release \
             --dart-define=ENV=prod \
+            --dart-define=DIST_CHANNEL=direct \
             --dart-define=PROD_API_HOST=${{ secrets.PROD_API_HOST }}
           echo ""
           echo "=== Windows 构建完成 ==="
@@ -225,6 +233,10 @@ jobs:
             'Compression=lzma2/max'
             'SolidCompression=yes'
             'WizardStyle=modern'
+            # 应用内静默更新由客户端拉起安装包：安装前自动关闭仍在运行的 EnjoyCards，
+            # 避免 exe 被占用导致覆盖失败。
+            'CloseApplications=yes'
+            'RestartApplications=no'
             'UninstallDisplayName=EnjoyCards'
             'UninstallDisplayIcon={app}\enjoycards_app.exe'
             "OutputDir=$outDir"
@@ -251,6 +263,14 @@ jobs:
             ''
             '[Run]'
             'Filename: "{app}\enjoycards_app.exe"; Description: "{cm:LaunchProgram,EnjoyCards}"; Flags: nowait postinstall skipifsilent'
+            # 应用内静默更新：安装完成后自动拉起应用（仅在 /SILENT 模式下生效）
+            'Filename: "{app}\enjoycards_app.exe"; Flags: nowait; Check: IsSilentMode'
+            ''
+            '[Code]'
+            'function IsSilentMode: Boolean;'
+            'begin'
+            '  Result := WizardSilent;'
+            'end;'
           )
           [System.IO.File]::WriteAllLines($issPath, $issLines, (New-Object System.Text.UTF8Encoding($true)))
           Write-Host "Inno Setup 脚本: $issPath"
@@ -272,6 +292,7 @@ jobs:
           Write-Host "✅ SHA-256: $hash"
 
           "version=$fileVersion" >> $env:GITHUB_OUTPUT
+          "version_code=$buildNumber" >> $env:GITHUB_OUTPUT
           "exe_name=$exeName"     >> $env:GITHUB_OUTPUT
           "exe_size=$exeSize"     >> $env:GITHUB_OUTPUT
           "sha256=$hash"          >> $env:GITHUB_OUTPUT
@@ -387,6 +408,8 @@ jobs:
           echo "后续手工步骤："
           echo "1. 上传 ./dist/EnjoyCards-Setup-<version>.exe 到官网发布服务器 / CDN"
           echo "2. 在后端登记版本（package_name = com.enjoycards.app.windows），"
-          echo "   填入上面的文件名、大小与 SHA-256"
+          echo "   versionCode 必须填构建号 ${{ steps.package.outputs.version_code }}（即 ${{ steps.package.outputs.version }} 的末段），"
+          echo "   不能填 1.0.2 / 1002 之类的写法，否则客户端比对不出「有新版本」；"
+          echo "   同时填入上面的文件名、大小与 SHA-256"
           echo "3. 打开 https://www.enjoycards.app/en/download/ 确认按钮变为可下载状态"
           echo "========================================"
