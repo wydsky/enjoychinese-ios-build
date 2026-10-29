@@ -167,6 +167,7 @@ jobs:
           # 构建号来自本平台独立计数器（见 Manage Android Build Version 步骤）
           flutter build appbundle \
             --release \
+            --flavor play \
             --build-number=${{ steps.ver.outputs.build_number }} \
             --dart-define=ENV=prod \
             --dart-define=PROD_API_HOST=${{ secrets.PROD_API_HOST }} \
@@ -178,13 +179,13 @@ jobs:
         working-directory: ./source-code/enjoychinese_app
         run: |
           echo "=== AAB File List ==="
-          ls -la build/app/outputs/bundle/release/
+          ls -la build/app/outputs/bundle/playRelease/
           echo ""
           echo "=== File Size ==="
-          du -h build/app/outputs/bundle/release/*.aab
+          du -h build/app/outputs/bundle/playRelease/*.aab
           echo ""
           
-          AAB_PATH=$(find build/app/outputs/bundle/release -name "app-release.aab" -type f)
+          AAB_PATH=$(find build/app/outputs/bundle/playRelease -name "app-play-release.aab" -type f)
           if [ -f "$AAB_PATH" ]; then
             echo "✅ AAB found: $AAB_PATH"
           else
@@ -192,11 +193,11 @@ jobs:
             exit 1
           fi
 
-      - name: 🔍 Verify AAB Permissions (BILLING)
+      - name: 🔍 Verify AAB Permissions (BILLING / 不含安装权限)
         working-directory: ./source-code/enjoychinese_app
         run: |
           echo "=== Checking AAB Permissions ==="
-          AAB_PATH=$(find build/app/outputs/bundle/release -name "app-release.aab" -type f)
+          AAB_PATH=$(find build/app/outputs/bundle/playRelease -name "app-play-release.aab" -type f)
           
           echo "Checking $AAB_PATH ..."
           # Extract base module manifest from AAB (AAB is a zip file)
@@ -206,20 +207,28 @@ jobs:
           # Search for BILLING permission in binary XML
           if strings /tmp/base_manifest.xml | grep -q "com.android.vending.BILLING"; then
             echo "✅ Permission check passed: com.android.vending.BILLING found"
-            echo "All permissions found:"
-            strings /tmp/base_manifest.xml | grep "android.permission"
           else
             echo "❌ Permission check FAILED: com.android.vending.BILLING missing"
-            echo "All permissions in manifest:"
             strings /tmp/base_manifest.xml | grep "android.permission"
             exit 1
           fi
+
+          # Google Play 拒收声明了 REQUEST_INSTALL_PACKAGES 且无正当用途的应用：
+          # 该权限只允许出现在官网直装包（direct flavor），play flavor 必须不含。
+          if strings /tmp/base_manifest.xml | grep -q "android.permission.REQUEST_INSTALL_PACKAGES"; then
+            echo "❌ Permission check FAILED: REQUEST_INSTALL_PACKAGES must not be in the Play AAB"
+            exit 1
+          else
+            echo "✅ Permission check passed: REQUEST_INSTALL_PACKAGES absent"
+          fi
+          echo "All permissions found:"
+          strings /tmp/base_manifest.xml | grep "android.permission"
 
       - name: 📦 Upload AAB artifact
         uses: actions/upload-artifact@v4
         with:
           name: enjoychinese-prod-aab
-          path: ./source-code/enjoychinese_app/build/app/outputs/bundle/release/*.aab
+          path: ./source-code/enjoychinese_app/build/app/outputs/bundle/playRelease/*.aab
           if-no-files-found: error
 
       - name: 🔑 Decode Google Play Service Account Key
@@ -231,7 +240,7 @@ jobs:
         with:
           serviceAccountJson: /tmp/google-play-key.json
           packageName: com.enjoychinese.app
-          releaseFiles: ./source-code/enjoychinese_app/build/app/outputs/bundle/release/app-release.aab
+          releaseFiles: ./source-code/enjoychinese_app/build/app/outputs/bundle/playRelease/app-play-release.aab
           tracks: ${{ github.event.inputs.track }}
           status: completed
 
