@@ -1,9 +1,10 @@
 name: EnjoyCards Windows Portable Build (官网下载 · Inno Setup 安装包)
 
-# 用途：构建 EnjoyCards Windows 桌面版，用 Inno Setup 打包成「带安装向导的安装包」并作为
-# Artifact 提供下载。该安装包由你下载后手动上传到官网/发布服务器，并在后端登记版本
-# （app_version 表 package_name = com.enjoycards.app.windows），官网的 /js/download.js
-# 会据此展示版本、文件大小与 SHA-256。
+# 用途：构建 EnjoyCards Windows 桌面版，用 Inno Setup 打包成「带安装向导的安装包」，
+# 上传为 Artifact 并（配置 OPEN_API_* Secrets 后）通过开放接口自动上传 COS、
+# 在后端 app_version 表登记版本（package_name = com.enjoycards.app.windows），
+# 官网的 /js/download.js 据此展示版本、文件大小与 SHA-256 并即时可下载。
+# 未配置 Secrets 时自动发布步骤跳过，仍按原方式下载 Artifact 手工发布。
 #
 # 与 enjoycards-windows-build.yml 的分工：
 #   - 本文件          → 官网直接下载用的 Inno Setup 安装包（安装向导/快捷方式/卸载入口）
@@ -25,6 +26,11 @@ jobs:
     name: 构建EnjoyCards Windows便携版（Inno Setup 安装包，供官网下载）
     permissions:
       contents: read
+    # 开放接口 AK/SK（GitHub Secrets 提供）；未配置时下方自动发布步骤会跳过
+    env:
+      OPEN_API_BASE_URL: ${{ secrets.OPEN_API_BASE_URL }}
+      OPEN_API_AK: ${{ secrets.OPEN_API_AK }}
+      OPEN_API_SK: ${{ secrets.OPEN_API_SK }}
     steps:
       - name: 📋 Checkout 当前打包仓库
         uses: actions/checkout@v4
@@ -297,7 +303,7 @@ jobs:
           "exe_size=$exeSize"     >> $env:GITHUB_OUTPUT
           "sha256=$hash"          >> $env:GITHUB_OUTPUT
 
-      - name: 📦 上传Artifact（供下载后手动上传到官网）
+      - name: 📦 上传Artifact（备份 / 未配置开放接口时手工发布）
         uses: actions/upload-artifact@v4
         with:
           name: enjoycards-prod-windows-portable
@@ -306,7 +312,25 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
-      # 便携版无商店交付渠道，交付物 = GitHub Artifact，故结算紧跟 artifact 上传成功之后。
+      # 通过开放接口（AK/SK 签名）完成「上传安装包 → 登记 app_version」，
+      # 官网 /v1/app/latest 与 /js/download.js 随即可见，替代原先「下载 Artifact + 手工上传 + 手工登记」。
+      # 必须在结算构建号之前执行：发布失败则计数器不落盘，下次构建会重试同一个版本号。
+      - name: 🌐 发布到官网（开放接口）
+        shell: bash
+        run: |
+          if [ -z "${OPEN_API_BASE_URL:-}" ] || [ -z "${OPEN_API_AK:-}" ] || [ -z "${OPEN_API_SK:-}" ]; then
+            echo "::notice::未配置 OPEN_API_BASE_URL/OPEN_API_AK/OPEN_API_SK，跳过自动发布（仍可用 Artifact 手工发布）"
+            exit 0
+          fi
+          bash "deploy/ios-android-build/scripts/publish-apk-open-api.sh" \
+            "source-code/enjoycards_app/build/windows/site/${{ steps.package.outputs.exe_name }}" \
+            "com.enjoycards.app.windows" \
+            "EnjoyCards" \
+            "${{ steps.ver.outputs.version_name }}" \
+            "${{ steps.package.outputs.version_code }}" \
+            "Windows 官网版 ${{ steps.ver.outputs.version_name }}"
+
+      # 便携版无商店交付渠道，交付物 = GitHub Artifact，故结算紧跟 artifact 上传（及官网发布）成功之后。
       - name: 📌 结算构建版本号
         shell: bash
         run: |
@@ -405,7 +429,8 @@ jobs:
           echo "  gh run download ${{ github.run_id }} --repo ${{ github.repository }} -n enjoycards-prod-windows-portable -D ./dist"
           echo "  （gh 会自动解压 artifact，./dist 下直接就是 EnjoyCards-Setup-<version>.exe）"
           echo ""
-          echo "后续手工步骤："
+          echo "若已配置 OPEN_API_* Secrets，安装包已自动上传并发布到官网，无需手工操作；"
+          echo "若未配置（发布步骤被跳过），请手工执行："
           echo "1. 上传 ./dist/EnjoyCards-Setup-<version>.exe 到官网发布服务器 / CDN"
           echo "2. 在后端登记版本（package_name = com.enjoycards.app.windows），"
           echo "   versionCode 必须填构建号 ${{ steps.package.outputs.version_code }}（即 ${{ steps.package.outputs.version }} 的末段），"

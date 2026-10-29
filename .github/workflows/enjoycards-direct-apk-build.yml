@@ -22,6 +22,11 @@ jobs:
     name: Build EnjoyCards Direct APK（官网直装）
     permissions:
       contents: read
+    # 开放接口 AK/SK（GitHub Secrets 提供）；未配置时下方发布步骤自动跳过
+    env:
+      OPEN_API_BASE_URL: ${{ secrets.OPEN_API_BASE_URL }}
+      OPEN_API_AK: ${{ secrets.OPEN_API_AK }}
+      OPEN_API_SK: ${{ secrets.OPEN_API_SK }}
     steps:
       - name: 📋 Checkout repository
         uses: actions/checkout@v4
@@ -266,6 +271,24 @@ jobs:
           fi
           echo "✅ Version Management Complete: ${{ steps.ver.outputs.version_name }}+$BUILD_NUMBER"
 
+      # 通过开放接口（/api/open/v1/apk）完成「上传 APK → 登记 app_version」，
+      # 官网 /v1/app/latest 随即可见，替代原先的「下载 artifact + 手工上传 + 手工登记」。
+      # 未配置 OPEN_API_* Secrets 时跳过，原有手工发布流程不受影响。
+      - name: 🌐 Publish APK to 官网（开放接口）
+        working-directory: ./source-code/enjoycards_app
+        run: |
+          if [ -z "${OPEN_API_BASE_URL:-}" ] || [ -z "${OPEN_API_AK:-}" ] || [ -z "${OPEN_API_SK:-}" ]; then
+            echo "::notice::未配置 OPEN_API_BASE_URL/OPEN_API_AK/OPEN_API_SK，跳过自动发布（仍可用 Artifact 手工发布）"
+            exit 0
+          fi
+          bash "$GITHUB_WORKSPACE/deploy/ios-android-build/scripts/publish-apk-open-api.sh" \
+            "dist/EnjoyCards-direct-v${{ steps.ver.outputs.version_name }}-b${{ steps.ver.outputs.build_number }}.apk" \
+            "com.enjoycards.app" \
+            "EnjoyCards" \
+            "${{ steps.ver.outputs.version_name }}" \
+            "${{ steps.ver.outputs.build_number }}" \
+            "官网直装版 ${{ steps.ver.outputs.version_name }}"
+
       - name: 🧹 Cleanup sensitive files
         if: always()
         run: |
@@ -283,7 +306,8 @@ jobs:
           echo "File: EnjoyCards-direct-v${{ steps.ver.outputs.version_name }}-b${{ steps.ver.outputs.build_number }}.apk"
           echo "Download: Actions 运行详情页底部 Artifacts 区域"
           echo ""
-          echo "后续手工步骤："
+          echo "若已配置 OPEN_API_* Secrets，APK 已自动上传并发布到官网，无需手工操作；"
+          echo "若未配置（发布步骤被跳过），请手工执行："
           echo "1. 下载 APK 并上传到官网发布服务器"
           echo "2. 在后端 app_version 表登记（package_name = com.enjoycards.app），"
           echo "   version_code 必须填 ${{ steps.ver.outputs.build_number }}，"
