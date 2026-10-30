@@ -1,264 +1,264 @@
-name: EnjoyChinese 官网直装 APK Build
-
-# 仅手动触发：构建官网下载版（direct flavor），产物上传为 Actions artifact 供下载。
-# 命名刻意与 Google Play 包区分：
-#   - 官网 APK artifact / 文件名：enjoychinese-direct-* / EnjoyChinese-direct-*.apk
-#   - Google Play 产物 artifact：enjoychinese-prod-aab / app-play-release.aab
-on:
-  workflow_dispatch:
-
-# 与 Google Play 构建 workflow 共用同一个 versionCode 计数器，必须串行执行：
-# 共用不是为了「官网包与商店包互相升级」——两者签名通常不同（Google Play 应用签名），
-# 本就无法交叉覆盖安装；共用是为了同一 applicationId 的版本号严格单调递增，
-# 避免某一渠道的计数跑高后，另一渠道的下一次构建编号更低。
-concurrency:
-  group: enjoychinese-android-build
-  cancel-in-progress: false
-
-jobs:
-  build-direct-apk:
-    runs-on: ubuntu-latest
-    name: Build EnjoyChinese Direct APK（官网直装）
-    permissions:
-      contents: read
-    # 开放接口 AK/SK（GitHub Secrets 提供）；未配置时下方发布步骤自动跳过
-    env:
-      OPEN_API_BASE_URL: ${{ secrets.OPEN_API_BASE_URL }}
-      OPEN_API_AK: ${{ secrets.OPEN_API_AK }}
-      OPEN_API_SK: ${{ secrets.OPEN_API_SK }}
-    steps:
-      - name: 📋 Checkout repository
-        uses: actions/checkout@v4
-
-      - name: 📥 Pull private Gitee Flutter code
-        run: |
-          git clone -b client-release https://oauth2:${{ secrets.GITEE_TOKEN }}@gitee.com/yunhaninfo/enjoy-chinese.git source-code
-
-      # 与 Google Play workflow 完全一致的版本号规则：版本名取 pubspec，构建号由本平台计数器自增。
-      # 两个渠道共用计数器（见文件头 concurrency 说明）：保证包名维度的 versionCode 单调递增，
-      # 不表示官网包可以覆盖商店包——签名不同时系统会直接拒绝安装。
-      # 这里只计算不落盘，产物上传成功后再写入，失败不消耗版本号。
-      - name: 🔢 Manage Android Build Version
-        id: ver
-        working-directory: ./source-code
-        run: |
-          set -e
-          echo "========================================"
-          echo "🔢 Managing EnjoyChinese Android Build Version"
-          echo "========================================"
-
-          VERSION_NAME=$(grep "^version:" enjoychinese_app/pubspec.yaml | sed 's/version: *//' | cut -d+ -f1 | tr -d ' ')
-          if [ -z "$VERSION_NAME" ]; then
-            echo "❌ 无法从 pubspec.yaml 解析版本名"
-            exit 1
-          fi
-          echo "Version name: $VERSION_NAME"
-
-          VERSION_TRACK_FILE=".github/deploy/version-enjoychinese-android.txt"
-          VERSION_FILE="$GITHUB_WORKSPACE/$VERSION_TRACK_FILE"
-          LEGACY_FILE="$GITHUB_WORKSPACE/.github/deploy/version-android.txt"
-          if [ -f "$VERSION_FILE" ]; then
-            STORED_BUILD=$(cat "$VERSION_FILE" | tr -d ' \n')
-          elif [ -f "$LEGACY_FILE" ]; then
-            STORED_BUILD=$(cat "$LEGACY_FILE" | tr -d ' \n')
-            echo "ℹ️  计数器迁移：回退读取 $LEGACY_FILE = $STORED_BUILD"
-          else
-            STORED_BUILD="0"
-            echo "ℹ️  计数器文件不存在，初始化到 0"
-          fi
-
-          case "$STORED_BUILD" in
-            ''|*[!0-9]*)
-              echo "❌ 计数器文件内容非法: '$STORED_BUILD'（$VERSION_TRACK_FILE）"
-              exit 1
-              ;;
-          esac
-
-          NEW_BUILD=$((STORED_BUILD + 1))
-          echo "⬆️  Auto-incrementing: $STORED_BUILD → $NEW_BUILD"
-          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
-          echo "build_number=$NEW_BUILD"   >> "$GITHUB_OUTPUT"
-
-      - name: 🚀 Setup Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          flutter-version: '3.44.2'
-          channel: stable
-
-      - name: 💾 Cache Flutter dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.pub-cache
-            ./source-code/enjoychinese_app/.dart_tool
-          key: ${{ runner.os }}-enjoychinese-flutter-${{ hashFiles('source-code/enjoychinese_app/pubspec.lock') }}
-
-      - name: 📦 Install Flutter dependencies
-        working-directory: ./source-code/enjoychinese_app
-        run: flutter pub get
-
-      - name: 🏗️ Generate code (json_serializable, etc.)
-        working-directory: ./source-code/enjoychinese_app
-        run: dart run build_runner build --delete-conflicting-outputs
-
-      - name: 🛠️ Setup Java 17
-        uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: 'temurin'
-          cache: 'gradle'
-
-      - name: 🛠️ Setup Android SDK
-        run: |
-          SDK=${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}
-          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
-          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
-          SCM=""
-          for d in "$SDK"/cmdline-tools/*/; do
-            if [ -x "$d/bin/sdkmanager" ]; then SCM="$d/bin/sdkmanager"; break; fi
-          done
-          [ -n "$SCM" ] || SCM="$SDK/cmdline-tools/latest/bin/sdkmanager"
-          echo "sdkmanager: $SCM"
-          yes | "$SCM" --licenses --sdk_root="$SDK" >/dev/null || true
-          "$SCM" --sdk_root="$SDK" \
-            "platform-tools" \
-            "platforms;android-36" \
-            "build-tools;35.0.0" \
-            "ndk;26.1.10909125"
-
-      - name: 🔑 Decode keystore file
-        run: |
-          mkdir -p ./source-code/enjoychinese_app/android/app/keys
-          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > ./source-code/enjoychinese_app/android/app/keys/enjoychinese-release.jks
-
-      - name: 📝 Generate key.properties
-        working-directory: ./source-code/enjoychinese_app/android
-        run: |
-          cat > key.properties <<EOF
-          # build.gradle.kts 位于 android/app，file() 从 android/app 目录解析路径
-          storeFile=./keys/enjoychinese-release.jks
-          storePassword=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}
-          keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}
-          EOF
-
-      # 官网直装包 = direct flavor（携带 REQUEST_INSTALL_PACKAGES + 开启应用内更新）
-      - name: 🔨 Build 官网直装 APK (direct flavor)
-        working-directory: ./source-code/enjoychinese_app
-        run: |
-          echo "=== Starting Direct APK Build ==="
-          flutter build apk \
-            --release \
-            --flavor direct \
-            --build-number=${{ steps.ver.outputs.build_number }} \
-            --dart-define=ENV=prod \
-            --dart-define=PROD_API_HOST=${{ secrets.PROD_API_HOST }} \
-            --dart-define=REVENUECAT_API_KEY=${{ secrets.REVENUECAT_GOOGLE_API_KEY }} \
-            --dart-define=DIST_CHANNEL=direct
-          echo "=== Build Completed ==="
-
-      - name: ✅ Verify APK permissions & prepare download file
-        working-directory: ./source-code/enjoychinese_app
-        env:
-          VERSION_NAME: ${{ steps.ver.outputs.version_name }}
-          BUILD_NUMBER: ${{ steps.ver.outputs.build_number }}
-        run: |
-          set -e
-          APK_SRC="build/app/outputs/flutter-apk/app-direct-release.apk"
-          if [ ! -f "$APK_SRC" ]; then
-            echo "❌ APK not found: $APK_SRC"
-            ls -la build/app/outputs/flutter-apk/ || true
-            exit 1
-          fi
-
-          # 官网包必须带安装未知应用权限，否则应用内更新无法拉起安装器
-          AAPT2=$(ls "$ANDROID_SDK_ROOT"/build-tools/*/aapt2 | sort -V | tail -1)
-          echo "aapt2: $AAPT2"
-          PERMS=$("$AAPT2" dump permissions "$APK_SRC")
-          echo "$PERMS"
-          if ! echo "$PERMS" | grep -q "android.permission.REQUEST_INSTALL_PACKAGES"; then
-            echo "❌ 校验失败：direct 包缺少 REQUEST_INSTALL_PACKAGES，应用内更新将不可用"
-            exit 1
-          fi
-          if ! echo "$PERMS" | grep -q "com.android.vending.BILLING"; then
-            echo "❌ 校验失败：缺少 com.android.vending.BILLING"
-            exit 1
-          fi
-
-          # 与 Google Play 产物明显区分：direct 前缀 + v<版本名>-b<构建号>
-          mkdir -p dist
-          OUT="dist/EnjoyChinese-direct-v${VERSION_NAME}-b${BUILD_NUMBER}.apk"
-          cp "$APK_SRC" "$OUT"
-          sha256sum "$OUT" | tee "$OUT.sha256"
-          echo "✅ Direct APK: $OUT"
-          ls -lh dist/
-
-      - name: 📦 Upload 官网 APK artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: enjoychinese-direct-apk-v${{ steps.ver.outputs.version_name }}-b${{ steps.ver.outputs.build_number }}
-          path: ./source-code/enjoychinese_app/dist/*
-          if-no-files-found: error
-          retention-days: 30
-
-      # 产物已生成并归档后再结算版本号：失败不消耗编号，成功则保证下次构建号递增。
-      - name: 📌 结算构建版本号
-        shell: bash
-        env:
-          GH_PAT: ${{ secrets.GH_PAT }}
-        run: |
-          set -e
-          BUILD_NUMBER="${{ steps.ver.outputs.build_number }}"
-          VERSION_TRACK_FILE=".github/deploy/version-enjoychinese-android.txt"
-          echo "待写入计数器: $VERSION_TRACK_FILE = $BUILD_NUMBER"
-
-          COMMIT_MSG="chore: update EnjoyChinese Android build version tracking to $BUILD_NUMBER [skip ci]"
-          ENCODED_CONTENT=$(printf '%s' "$BUILD_NUMBER" | base64 | tr -d '\n')
-          API_URL="https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/${VERSION_TRACK_FILE}"
-
-          FILE_SHA=""
-          HTTP_CODE=$(curl -s -o /tmp/api_response.json -w "%{http_code}" \
-            -H "Authorization: Bearer ${GH_PAT}" \
-            -H "Accept: application/vnd.github+json" \
-            "$API_URL")
-          if [ "$HTTP_CODE" = "200" ]; then
-            FILE_SHA=$(jq -r '.sha' /tmp/api_response.json)
-          else
-            echo "ℹ️  计数器文件尚不存在（HTTP $HTTP_CODE），将新建"
-          fi
-
-          if [ -n "$FILE_SHA" ]; then
-            JSON_BODY=$(jq -n --arg msg "$COMMIT_MSG" --arg content "$ENCODED_CONTENT" --arg sha "$FILE_SHA" \
-              '{message: $msg, content: $content, sha: $sha}')
-          else
-            JSON_BODY=$(jq -n --arg msg "$COMMIT_MSG" --arg content "$ENCODED_CONTENT" \
-              '{message: $msg, content: $content}')
-          fi
-
-          SUCCESS=0
-          for attempt in 1 2 3; do
-            UPDATE_CODE=$(curl -s -o /tmp/update_response.json -w "%{http_code}" \
-              -X PUT \
-              -H "Authorization: Bearer ${GH_PAT}" \
-              -H "Accept: application/vnd.github+json" \
-              -H "Content-Type: application/json" \
-              -d "$JSON_BODY" \
-              "$API_URL")
-            if [ "$UPDATE_CODE" = "200" ] || [ "$UPDATE_CODE" = "201" ]; then
-              SUCCESS=1
-              break
-            fi
-            echo "⚠️  写入失败（第 $attempt 次，HTTP $UPDATE_CODE）"
-            cat /tmp/update_response.json || true
-            sleep $((attempt * 3))
-          done
-
-          if [ "$SUCCESS" != "1" ]; then
-            echo "❌ 版本计数器写入失败，请手动把 $VERSION_TRACK_FILE 改为 $BUILD_NUMBER"
-            exit 1
-          fi
-          echo "✅ Version Management Complete: ${{ steps.ver.outputs.version_name }}+$BUILD_NUMBER"
-
+name: EnjoyChinese 官网直装 APK Build
+
+# 仅手动触发：构建官网下载版（direct flavor），产物上传为 Actions artifact 供下载。
+# 命名刻意与 Google Play 包区分：
+#   - 官网 APK artifact / 文件名：enjoychinese-direct-* / EnjoyChinese-direct-*.apk
+#   - Google Play 产物 artifact：enjoychinese-prod-aab / app-play-release.aab
+on:
+  workflow_dispatch:
+
+# 与 Google Play 构建 workflow 共用同一个 versionCode 计数器，必须串行执行：
+# 共用不是为了「官网包与商店包互相升级」——两者签名通常不同（Google Play 应用签名），
+# 本就无法交叉覆盖安装；共用是为了同一 applicationId 的版本号严格单调递增，
+# 避免某一渠道的计数跑高后，另一渠道的下一次构建编号更低。
+concurrency:
+  group: enjoychinese-android-build
+  cancel-in-progress: false
+
+jobs:
+  build-direct-apk:
+    runs-on: ubuntu-latest
+    name: Build EnjoyChinese Direct APK（官网直装）
+    permissions:
+      contents: read
+    # 开放接口 AK/SK（GitHub Secrets 提供）；未配置时下方发布步骤自动跳过
+    env:
+      OPEN_API_BASE_URL: ${{ secrets.OPEN_API_BASE_URL }}
+      OPEN_API_AK: ${{ secrets.OPEN_API_AK }}
+      OPEN_API_SK: ${{ secrets.OPEN_API_SK }}
+    steps:
+      - name: 📋 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 📥 Pull private Gitee Flutter code
+        run: |
+          git clone -b client-release https://oauth2:${{ secrets.GITEE_TOKEN }}@gitee.com/yunhaninfo/enjoy-chinese.git source-code
+
+      # 与 Google Play workflow 完全一致的版本号规则：版本名取 pubspec，构建号由本平台计数器自增。
+      # 两个渠道共用计数器（见文件头 concurrency 说明）：保证包名维度的 versionCode 单调递增，
+      # 不表示官网包可以覆盖商店包——签名不同时系统会直接拒绝安装。
+      # 这里只计算不落盘，产物上传成功后再写入，失败不消耗版本号。
+      - name: 🔢 Manage Android Build Version
+        id: ver
+        working-directory: ./source-code
+        run: |
+          set -e
+          echo "========================================"
+          echo "🔢 Managing EnjoyChinese Android Build Version"
+          echo "========================================"
+
+          VERSION_NAME=$(grep "^version:" enjoychinese_app/pubspec.yaml | sed 's/version: *//' | cut -d+ -f1 | tr -d ' ')
+          if [ -z "$VERSION_NAME" ]; then
+            echo "❌ 无法从 pubspec.yaml 解析版本名"
+            exit 1
+          fi
+          echo "Version name: $VERSION_NAME"
+
+          VERSION_TRACK_FILE=".github/deploy/version-enjoychinese-android.txt"
+          VERSION_FILE="$GITHUB_WORKSPACE/$VERSION_TRACK_FILE"
+          LEGACY_FILE="$GITHUB_WORKSPACE/.github/deploy/version-android.txt"
+          if [ -f "$VERSION_FILE" ]; then
+            STORED_BUILD=$(cat "$VERSION_FILE" | tr -d ' \n')
+          elif [ -f "$LEGACY_FILE" ]; then
+            STORED_BUILD=$(cat "$LEGACY_FILE" | tr -d ' \n')
+            echo "ℹ️  计数器迁移：回退读取 $LEGACY_FILE = $STORED_BUILD"
+          else
+            STORED_BUILD="0"
+            echo "ℹ️  计数器文件不存在，初始化到 0"
+          fi
+
+          case "$STORED_BUILD" in
+            ''|*[!0-9]*)
+              echo "❌ 计数器文件内容非法: '$STORED_BUILD'（$VERSION_TRACK_FILE）"
+              exit 1
+              ;;
+          esac
+
+          NEW_BUILD=$((STORED_BUILD + 1))
+          echo "⬆️  Auto-incrementing: $STORED_BUILD → $NEW_BUILD"
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          echo "build_number=$NEW_BUILD"   >> "$GITHUB_OUTPUT"
+
+      - name: 🚀 Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.2'
+          channel: stable
+
+      - name: 💾 Cache Flutter dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            ./source-code/enjoychinese_app/.dart_tool
+          key: ${{ runner.os }}-enjoychinese-flutter-${{ hashFiles('source-code/enjoychinese_app/pubspec.lock') }}
+
+      - name: 📦 Install Flutter dependencies
+        working-directory: ./source-code/enjoychinese_app
+        run: flutter pub get
+
+      - name: 🏗️ Generate code (json_serializable, etc.)
+        working-directory: ./source-code/enjoychinese_app
+        run: dart run build_runner build --delete-conflicting-outputs
+
+      - name: 🛠️ Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: 🛠️ Setup Android SDK
+        run: |
+          SDK=${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          SCM=""
+          for d in "$SDK"/cmdline-tools/*/; do
+            if [ -x "$d/bin/sdkmanager" ]; then SCM="$d/bin/sdkmanager"; break; fi
+          done
+          [ -n "$SCM" ] || SCM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          echo "sdkmanager: $SCM"
+          yes | "$SCM" --licenses --sdk_root="$SDK" >/dev/null || true
+          "$SCM" --sdk_root="$SDK" \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;35.0.0" \
+            "ndk;26.1.10909125"
+
+      - name: 🔑 Decode keystore file
+        run: |
+          mkdir -p ./source-code/enjoychinese_app/android/app/keys
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > ./source-code/enjoychinese_app/android/app/keys/enjoychinese-release.jks
+
+      - name: 📝 Generate key.properties
+        working-directory: ./source-code/enjoychinese_app/android
+        run: |
+          cat > key.properties <<EOF
+          # build.gradle.kts 位于 android/app，file() 从 android/app 目录解析路径
+          storeFile=./keys/enjoychinese-release.jks
+          storePassword=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}
+          keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}
+          EOF
+
+      # 官网直装包 = direct flavor（携带 REQUEST_INSTALL_PACKAGES + 开启应用内更新）
+      - name: 🔨 Build 官网直装 APK (direct flavor)
+        working-directory: ./source-code/enjoychinese_app
+        run: |
+          echo "=== Starting Direct APK Build ==="
+          flutter build apk \
+            --release \
+            --flavor direct \
+            --build-number=${{ steps.ver.outputs.build_number }} \
+            --dart-define=ENV=prod \
+            --dart-define=PROD_API_HOST=${{ secrets.PROD_API_HOST }} \
+            --dart-define=REVENUECAT_API_KEY=${{ secrets.REVENUECAT_GOOGLE_API_KEY }} \
+            --dart-define=DIST_CHANNEL=direct
+          echo "=== Build Completed ==="
+
+      - name: ✅ Verify APK permissions & prepare download file
+        working-directory: ./source-code/enjoychinese_app
+        env:
+          VERSION_NAME: ${{ steps.ver.outputs.version_name }}
+          BUILD_NUMBER: ${{ steps.ver.outputs.build_number }}
+        run: |
+          set -e
+          APK_SRC="build/app/outputs/flutter-apk/app-direct-release.apk"
+          if [ ! -f "$APK_SRC" ]; then
+            echo "❌ APK not found: $APK_SRC"
+            ls -la build/app/outputs/flutter-apk/ || true
+            exit 1
+          fi
+
+          # 官网包必须带安装未知应用权限，否则应用内更新无法拉起安装器
+          AAPT2=$(ls "$ANDROID_SDK_ROOT"/build-tools/*/aapt2 | sort -V | tail -1)
+          echo "aapt2: $AAPT2"
+          PERMS=$("$AAPT2" dump permissions "$APK_SRC")
+          echo "$PERMS"
+          if ! echo "$PERMS" | grep -q "android.permission.REQUEST_INSTALL_PACKAGES"; then
+            echo "❌ 校验失败：direct 包缺少 REQUEST_INSTALL_PACKAGES，应用内更新将不可用"
+            exit 1
+          fi
+          if ! echo "$PERMS" | grep -q "com.android.vending.BILLING"; then
+            echo "❌ 校验失败：缺少 com.android.vending.BILLING"
+            exit 1
+          fi
+
+          # 与 Google Play 产物明显区分：direct 前缀 + v<版本名>-b<构建号>
+          mkdir -p dist
+          OUT="dist/EnjoyChinese-direct-v${VERSION_NAME}-b${BUILD_NUMBER}.apk"
+          cp "$APK_SRC" "$OUT"
+          sha256sum "$OUT" | tee "$OUT.sha256"
+          echo "✅ Direct APK: $OUT"
+          ls -lh dist/
+
+      - name: 📦 Upload 官网 APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: enjoychinese-direct-apk-v${{ steps.ver.outputs.version_name }}-b${{ steps.ver.outputs.build_number }}
+          path: ./source-code/enjoychinese_app/dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+      # 产物已生成并归档后再结算版本号：失败不消耗编号，成功则保证下次构建号递增。
+      - name: 📌 结算构建版本号
+        shell: bash
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          set -e
+          BUILD_NUMBER="${{ steps.ver.outputs.build_number }}"
+          VERSION_TRACK_FILE=".github/deploy/version-enjoychinese-android.txt"
+          echo "待写入计数器: $VERSION_TRACK_FILE = $BUILD_NUMBER"
+
+          COMMIT_MSG="chore: update EnjoyChinese Android build version tracking to $BUILD_NUMBER [skip ci]"
+          ENCODED_CONTENT=$(printf '%s' "$BUILD_NUMBER" | base64 | tr -d '\n')
+          API_URL="https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/${VERSION_TRACK_FILE}"
+
+          FILE_SHA=""
+          HTTP_CODE=$(curl -s -o /tmp/api_response.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${GH_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            "$API_URL")
+          if [ "$HTTP_CODE" = "200" ]; then
+            FILE_SHA=$(jq -r '.sha' /tmp/api_response.json)
+          else
+            echo "ℹ️  计数器文件尚不存在（HTTP $HTTP_CODE），将新建"
+          fi
+
+          if [ -n "$FILE_SHA" ]; then
+            JSON_BODY=$(jq -n --arg msg "$COMMIT_MSG" --arg content "$ENCODED_CONTENT" --arg sha "$FILE_SHA" \
+              '{message: $msg, content: $content, sha: $sha}')
+          else
+            JSON_BODY=$(jq -n --arg msg "$COMMIT_MSG" --arg content "$ENCODED_CONTENT" \
+              '{message: $msg, content: $content}')
+          fi
+
+          SUCCESS=0
+          for attempt in 1 2 3; do
+            UPDATE_CODE=$(curl -s -o /tmp/update_response.json -w "%{http_code}" \
+              -X PUT \
+              -H "Authorization: Bearer ${GH_PAT}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Content-Type: application/json" \
+              -d "$JSON_BODY" \
+              "$API_URL")
+            if [ "$UPDATE_CODE" = "200" ] || [ "$UPDATE_CODE" = "201" ]; then
+              SUCCESS=1
+              break
+            fi
+            echo "⚠️  写入失败（第 $attempt 次，HTTP $UPDATE_CODE）"
+            cat /tmp/update_response.json || true
+            sleep $((attempt * 3))
+          done
+
+          if [ "$SUCCESS" != "1" ]; then
+            echo "❌ 版本计数器写入失败，请手动把 $VERSION_TRACK_FILE 改为 $BUILD_NUMBER"
+            exit 1
+          fi
+          echo "✅ Version Management Complete: ${{ steps.ver.outputs.version_name }}+$BUILD_NUMBER"
+
       # 通过开放接口（/api/open/v1/apk）完成「上传 APK → 登记 app_version」，
       # 官网 /v1/app/latest 随即可见，替代原先的「下载 artifact + 手工上传 + 手工登记」。
       # 未配置 OPEN_API_* Secrets 时跳过，原有手工发布流程不受影响。
@@ -277,20 +277,65 @@ jobs:
             "${{ steps.ver.outputs.build_number }}" \
             "官网直装版 ${{ steps.ver.outputs.version_name }}"
 
-      - name: 🧹 Cleanup sensitive files
-        if: always()
-        run: |
-          rm -f ./source-code/enjoychinese_app/android/key.properties
-          rm -f ./source-code/enjoychinese_app/android/app/keys/enjoychinese-release.jks
-          echo "✅ Cleanup completed"
+      - name: 🧹 Cleanup sensitive files
+        if: always()
+        run: |
+          rm -f ./source-code/enjoychinese_app/android/key.properties
+          rm -f ./source-code/enjoychinese_app/android/app/keys/enjoychinese-release.jks
+          echo "✅ Cleanup completed"
+
+      - name: 📊 Build Result Report
+        run: |
+          echo "========================================"
+          echo "🎉 EnjoyChinese Direct APK Build Complete"
+          echo "========================================"
+          echo "Version: ${{ steps.ver.outputs.version_name }}+${{ steps.ver.outputs.build_number }}"
+          echo "Artifact: enjoychinese-direct-apk-v${{ steps.ver.outputs.version_name }}-b${{ steps.ver.outputs.build_number }}"
+          echo "File: EnjoyChinese-direct-v${{ steps.ver.outputs.version_name }}-b${{ steps.ver.outputs.build_number }}.apk"
+          echo "Download: Actions 运行详情页底部 Artifacts 区域"
+          echo "========================================"
 
-      - name: 📊 Build Result Report
+  # ============================================================
+  # 企业微信通知：成功 / 失败都推送，与其他构建 workflow 保持一致。
+  # Webhook key 来自 Secrets.WECHAT_WORK_WEBHOOK_KEY；未配置时仅通知缺失，不影响构建结果。
+  # ============================================================
+  notify:
+    needs: build-direct-apk
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify success
+        if: needs.build-direct-apk.result == 'success'
         run: |
-          echo "========================================"
-          echo "🎉 EnjoyChinese Direct APK Build Complete"
-          echo "========================================"
-          echo "Version: ${{ steps.ver.outputs.version_name }}+${{ steps.ver.outputs.build_number }}"
-          echo "Artifact: enjoychinese-direct-apk-v${{ steps.ver.outputs.version_name }}-b${{ steps.ver.outputs.build_number }}"
-          echo "File: EnjoyChinese-direct-v${{ steps.ver.outputs.version_name }}-b${{ steps.ver.outputs.build_number }}.apk"
-          echo "Download: Actions 运行详情页底部 Artifacts 区域"
-          echo "========================================"
+          MESSAGE="✅ EnjoyChinese Android 官网直装 APK 构建成功
+
+          App: com.enjoychinese.app
+          Commit: ${{ github.sha }}
+          Branch: ${{ github.ref_name }}
+
+          View: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          jq -n --arg content "$MESSAGE" '{
+            msgtype: "text",
+            text: { content: $content }
+          }' > /tmp/wechat_msg.json
+          curl -s -X POST "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=${{ secrets.WECHAT_WORK_WEBHOOK_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d @/tmp/wechat_msg.json
+
+      - name: Notify failure
+        if: needs.build-direct-apk.result == 'failure'
+        run: |
+          MESSAGE="❌ EnjoyChinese Android 官网直装 APK 构建失败
+
+          App: com.enjoychinese.app
+          Commit: ${{ github.sha }}
+          Branch: ${{ github.ref_name }}
+
+          Check: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          jq -n --arg content "$MESSAGE" '{
+            msgtype: "text",
+            text: { content: $content }
+          }' > /tmp/wechat_msg.json
+          curl -s -X POST "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=${{ secrets.WECHAT_WORK_WEBHOOK_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d @/tmp/wechat_msg.json

@@ -1,429 +1,474 @@
-name: EnjoyCards macOS Release Build & Upload (Mac App Store)
+name: EnjoyCards macOS Release Build & Upload (Mac App Store)
+
+on:
+  workflow_dispatch:
+
+# 同一平台的构建必须串行：并发运行会先后读到同一个计数器值，产生重复的构建号被 App Store Connect 拒收。
+# 跨平台之间不再需要互斥 —— 各平台只读写自己的计数器文件。
+concurrency:
+  group: enjoycards-macos-build
+  cancel-in-progress: false
+
+jobs:
+  build-macos:
+    runs-on: macos-26
+    name: 构建EnjoyCards macOS App并上传至App Store Connect (Mac App Store)
+    permissions:
+      contents: read
+    steps:
+      - name: 📋 Checkout 当前打包仓库
+        uses: actions/checkout@v4
+
+      - name: 🛠️ 自动检测并选择最新可用的 Xcode 版本
+        run: |
+          echo "=== 可用的 Xcode 版本 ==="
+          find /Applications -maxdepth 1 -type d -name "Xcode*.app" | sort -V
+          echo ""
+
+          AVAILABLE_XCODE=$(find /Applications -maxdepth 1 -type d -name "Xcode*.app" | sort -V | tail -1)
+          if [ -n "$AVAILABLE_XCODE" ]; then
+            echo "选择最新 Xcode: $AVAILABLE_XCODE"
+            sudo xcode-select -s "$AVAILABLE_XCODE/Contents/Developer"
+          else
+            echo "警告: 未找到 Xcode，使用默认配置"
+          fi
+
+          echo ""
+          echo "=== 当前 Xcode 版本 ==="
+          xcodebuild -version
+
+      - name: 📥 拉取私有Gitee Flutter代码
+        run: |
+          git clone -b client-release https://oauth2:${{ secrets.GITEE_TOKEN }}@gitee.com/yunhaninfo/enjoy-chinese.git source-code
+          cd source-code
+
+      - name: 🔢 Manage macOS Build Version
+        id: ver
+        working-directory: ./source-code
+        run: |
+          set -e
+          echo "========================================"
+          echo "🔢 Managing EnjoyCards macOS Build Version"
+          echo "========================================"
+
+          # 版本名：只取 pubspec `version:` 中 `+` 之前的部分（跨平台统一，人工维护）。
+          # pubspec 的 `+N` 只是本地开发默认值，CI 既不读取也不回写 —— 构建号改由本平台
+          # 独立计数器维护，避免各平台互相推高版本号。
+          VERSION_NAME=$(grep "^version:" enjoycards_app/pubspec.yaml | sed 's/version: *//' | cut -d+ -f1 | tr -d ' ')
+          if [ -z "$VERSION_NAME" ]; then
+            echo "❌ 无法从 pubspec.yaml 解析版本名"
+            exit 1
+          fi
+          echo "Version name: $VERSION_NAME"
+
+          # 本平台构建号计数器（部署仓库内，只由本 workflow 读写）
+          VERSION_TRACK_FILE=".github/deploy/version-enjoycards-macos.txt"
+          VERSION_FILE="$GITHUB_WORKSPACE/$VERSION_TRACK_FILE"
+          if [ -f "$VERSION_FILE" ]; then
+            STORED_BUILD=$(cat "$VERSION_FILE" | tr -d ' \n')
+          else
+            STORED_BUILD="0"
+            echo "ℹ️  Version tracking file not found, initializing to 0"
+          fi
+          echo "Stored build number: $STORED_BUILD"
+
+          # 内容非法时直接失败，不静默兜底：否则会把版本号重置，并直接撞上商店拒收
+          case "$STORED_BUILD" in
+            ''|*[!0-9]*)
+              echo "❌ 计数器文件内容非法: '$STORED_BUILD'（$VERSION_TRACK_FILE）"
+              exit 1
+              ;;
+          esac
+
+          # 独立自增：只看本平台的历史值，与其他平台无关
+          NEW_BUILD=$((STORED_BUILD + 1))
+          echo "⬆️  Auto-incrementing: $STORED_BUILD → $NEW_BUILD"
+
+          # 延迟写入：这里只计算 N 并透传，不落盘、不提交。
+          # 计数器由后续「📌 结算构建版本号」步骤在产物上传成功后才写入；
+          # 任何阶段失败都不会消耗版本号，因此也无需回滚。
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          echo "build_number=$NEW_BUILD"   >> "$GITHUB_OUTPUT"
+
+      - name: 🚀 配置 Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.2'
+          channel: stable
+
+      - name: 💾 缓存依赖
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            ~/Library/Caches/CocoaPods
+            ./source-code/enjoycards_app/.dart_tool
+            ./source-code/enjoycards_app/build/macos/SourcePackages
+          key: ${{ runner.os }}-enjoycards-macos-flutter-${{ hashFiles('source-code/enjoycards_app/pubspec.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-enjoycards-macos-flutter-
+
+      - name: 📦 安装项目依赖
+        working-directory: ./source-code/enjoycards_app
+        run: flutter pub get
+
+      - name: 🏗️ 生成代码（json_serializable等）
+        working-directory: ./source-code/enjoycards_app
+        run: dart run build_runner build --delete-conflicting-outputs
+
+      - name: 🔑 签名证书导入（Apple Distribution + Mac Installer，手动建库+ACL）
+        # 手动统管而非 import-codesign-certs@v2：其内部生成的 keychain 密码我们拿不到，
+        # 无法对 Installer 证书补 set-partition-list 的 ACL，导致它进库却不成 valid identity。
+        run: |
+          set -e
+          KEYCHAIN_NAME="signing_temp.keychain"
+          KEYCHAIN_FILE="$HOME/Library/Keychains/$KEYCHAIN_NAME"
+          KEYCHAIN_PW="$(uuidgen)"
+
+          echo "=== 创建签名 keychain ==="
+          rm -f "$KEYCHAIN_FILE"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN_FILE"
+          security set-keychain-settings "$KEYCHAIN_FILE"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN_FILE"
+
+          # 同时导入两张证书
+          printf '%s' "$P12_RELEASE_BASE64" | base64 -d > /tmp/p12_dist.p12
+          printf '%s' "$P12_MAC_INSTALLER_BASE64" | base64 -d > /tmp/p12_installer.p12
+
+          echo "=== 导入 Apple Distribution ==="
+          security import /tmp/p12_dist.p12 -k "$KEYCHAIN_FILE" -P "$P12_RELEASE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/productbuild
+
+          echo "=== 导入 Mac Installer ==="
+          security import /tmp/p12_installer.p12 -k "$KEYCHAIN_FILE" -P "$P12_MAC_INSTALLER_PASSWORD" -T /usr/bin/codesign -T /usr/bin/productbuild
+
+          # 关键：设置 ACL/partition-list，让 codesign/productbuild 能读取证书私钥，否则不成 valid identity
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PW" "$KEYCHAIN_FILE"
+
+          # 设为默认，供后续 find-identity / codesign / productbuild 使用
+          security list-keychains -d user -s "$KEYCHAIN_FILE" "$HOME/Library/Keychains/login.keychain-db"
+          security default-keychain -s "$KEYCHAIN_FILE"
+
+          echo "=== [诊断] 导入后全部 valid identities ==="
+          security find-identity -v
+
+          rm -f /tmp/p12_dist.p12 /tmp/p12_installer.p12
+        env:
+          P12_RELEASE_BASE64: ${{ secrets.P12_RELEASE_BASE64 }}
+          P12_RELEASE_PASSWORD: ${{ secrets.P12_RELEASE_PASSWORD }}
+          P12_MAC_INSTALLER_BASE64: ${{ secrets.P12_MAC_INSTALLER_BASE64 }}
+          P12_MAC_INSTALLER_PASSWORD: ${{ secrets.P12_MAC_INSTALLER_PASSWORD }}
+
+      - name: 📄 导入Mac App Store Provisioning Profile（EnjoyCards macOS）
+        run: |
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          # macOS 的 MAS profile 用 .provisionprofile 扩展；printf '%s' 避免换行/转义污染 base64 解码
+          printf '%s' "$PROV_ENJOYCARDS_MACOS_BASE64" | base64 -d \
+            > ~/Library/MobileDevice/Provisioning\ Profiles/enjoycards_macos.provisionprofile
+          echo "导入完成，文件大小：$(stat -f %z ~/Library/MobileDevice/Provisioning\ Profiles/enjoycards_macos.provisionprofile) 字节"
+          file ~/Library/MobileDevice/Provisioning\ Profiles/enjoycards_macos.provisionprofile
+        env:
+          PROV_ENJOYCARDS_MACOS_BASE64: ${{ secrets.PROV_ENJOYCARDS_MACOS_RELEASE_BASE64 }}
+
+      - name: 🔍 验证 Provisioning Profile 内容与Bundle ID
+        run: |
+          PROFILE_PATH=~/Library/MobileDevice/Provisioning\ Profiles/enjoycards_macos.provisionprofile
+          security cms -D -i "$PROFILE_PATH" > /tmp/profile.plist
+          PROFILE_NAME=$(/usr/libexec/PlistBuddy -c "Print :Name" /tmp/profile.plist)
+          APP_ID=$(/usr/libexec/PlistBuddy -c "Print :Entitlements:com.apple.application-identifier" /tmp/profile.plist)
+          echo "Profile Name: $PROFILE_NAME"
+          echo "App ID: $APP_ID"
+          if [[ "$APP_ID" == *"com.enjoycards.app" ]]; then
+            echo "✅ Profile 绑定 com.enjoycards.app"
+          else
+            echo "❌ Profile App ID 不匹配: $APP_ID (期望包含 com.enjoycards.app)"
+            exit 1
+          fi
+          # 输出 profile 名供后续 PROVISIONING_PROFILE_SPECIFIER 使用
+          echo "PROV_ENJOYCARDS_MACOS_RELEASE_NAME=$PROFILE_NAME"
+
+      - name: ✏️ 配置macOS工程的Bundle ID与签名（对齐 Mac App Store 同记录 com.enjoycards.app）
+        working-directory: ./source-code/enjoycards_app
+        run: |
+          PROV_NAME="$PROV_ENJOYCARDS_MACOS_RELEASE_NAME"
+          echo "将使用 Provisioning Profile: $PROV_NAME"
+
+          # 1) bundle id 统一为 com.enjoycards.app（与 ASC 中 enjoycards 的 iOS/macOS 记录一致）
+          if ! grep -q 'PRODUCT_BUNDLE_IDENTIFIER = com.enjoycards.app;' macos/Runner/Configs/AppInfo.xcconfig; then
+            perl -i -pe 's/PRODUCT_BUNDLE_IDENTIFIER = .*/PRODUCT_BUNDLE_IDENTIFIER = com.enjoycards.app;/' macos/Runner/Configs/AppInfo.xcconfig
+          fi
+          echo "=== AppInfo.xcconfig Bundle ID ==="
+          grep PRODUCT_BUNDLE_IDENTIFIER macos/Runner/Configs/AppInfo.xcconfig
+
+          # 2) Release 构建配置写入 MAS 签名设置（写进 Release.xcconfig，构建时生效）
+          XC=macos/Runner/Configs/Release.xcconfig
+          ensure() { grep -qF "$1" "$XC" || echo "$1" >> "$XC"; }
+          ensure "CODE_SIGN_STYLE = Manual"
+          ensure "DEVELOPMENT_TEAM = JU3D9VJFCN"
+          ensure "CODE_SIGN_IDENTITY = \"Apple Distribution\""
+          ensure "PROVISIONING_PROFILE_SPECIFIER = $PROV_NAME"
+          echo "=== Release.xcconfig 签名配置 ==="
+          cat "$XC"
+        env:
+          PROV_ENJOYCARDS_MACOS_RELEASE_NAME: ${{ secrets.PROV_ENJOYCARDS_MACOS_RELEASE_NAME }}
+
+      - name: 🔨 编译签名macOS App（Release, App Store）
+        working-directory: ./source-code/enjoycards_app
+        run: |
+          echo "=== 开始构建 EnjoyCards macOS App ==="
+          # CFBundleVersion 由 --build-number 决定，构建号来自本平台独立计数器
+          # （见 Manage macOS Build Version 步骤）
+          flutter build macos \
+            --release \
+            --build-number=${{ steps.ver.outputs.build_number }} \
+            --dart-define=ENV=prod \
+            --dart-define=PROD_API_HOST=${{ secrets.PROD_API_HOST }} \
+            --dart-define=REVENUECAT_API_KEY=${{ secrets.REVENUECAT_ENJOYCARDS_KEY_IOS }}
+          echo ""
+          echo "=== macOS App 构建完成 ==="
+
+      - name: ✅ 校验产物签名与Bundle ID
+        working-directory: ./source-code/enjoycards_app
+        run: |
+          APP_PATH="build/macos/Build/Products/Release/enjoycards_app.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "❌ 未找到产物: $APP_PATH"
+            ls -la build/macos/Build/Products/Release/ || true
+            exit 1
+          fi
+          echo "=== 产物大小 ==="
+          du -sh "$APP_PATH"
+          echo ""
+          echo "=== Bundle ID ==="
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP_PATH/Contents/Info.plist")
+          echo "Bundle ID: $BUNDLE_ID"
+          if [ "$BUNDLE_ID" = "com.enjoycards.app" ]; then
+            echo "✅ Bundle ID 正确"
+          else
+            echo "❌ Bundle ID 不匹配，期望 com.enjoycards.app"
+            exit 1
+          fi
+          echo ""
+          echo "=== 内嵌版本号 ==="
+          MAC_INFO="$APP_PATH/Contents/Info.plist"
+          SHORT_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$MAC_INFO")
+          BUILD_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$MAC_INFO")
+          echo "CFBundleShortVersionString: $SHORT_VERSION"
+          echo "CFBundleVersion:            $BUILD_VERSION"
+          # 断言产物真的带上了本平台计数器号，兜住 "--build-number 被忽略/被工程配置覆盖" 这类静默失效
+          EXPECTED_NAME="${{ steps.ver.outputs.version_name }}"
+          EXPECTED_BUILD="${{ steps.ver.outputs.build_number }}"
+          if [ "$BUILD_VERSION" != "$EXPECTED_BUILD" ]; then
+            echo "❌ CFBundleVersion=$BUILD_VERSION，期望 $EXPECTED_BUILD"
+            exit 1
+          fi
+          if [ "$SHORT_VERSION" != "$EXPECTED_NAME" ]; then
+            echo "❌ CFBundleShortVersionString=$SHORT_VERSION，期望 $EXPECTED_NAME"
+            exit 1
+          fi
+          echo "✅ 产物内嵌版本号与计数器一致：$SHORT_VERSION ($BUILD_VERSION)"
+          echo ""
+          echo "=== 签名验证 ==="
+          codesign --verify --deep --strict "$APP_PATH" && echo "✅ 代码签名验证通过"
+          codesign -dv --verbose=4 "$APP_PATH" 2>&1 | grep -E "Identifier|TeamIdentifier|flags|Authority" | head
+          echo ""
+          echo "=== Entitlements（沙箱+联网，App Store 必需） ==="
+          codesign -d --entitlements - --xml "$APP_PATH" 2>/dev/null > /tmp/macos_entitlements.plist || true
+          SAND_MISSING=false
+          for key in com.apple.security.app-sandbox com.apple.security.network.client; do
+            if grep -q "$key" /tmp/macos_entitlements.plist 2>/dev/null; then
+              echo "✅ 包含 $key"
+            else
+              echo "❌ 缺少 $key（Mac App Store 上架必需）"
+              SAND_MISSING=true
+            fi
+          done
+          if [ "$SAND_MISSING" = "true" ]; then
+            echo "❌ Entitlements 未正确嵌入，Mac App Store 会拒绝上传（90296）。"
+            echo "确认 Runner Release target 已设 CODE_SIGN_ENTITLEMENTS=Runner/Release.entitlements 且签名开启了该文件。"
+            exit 1
+          fi
+
+      - name: 📤 上传到 App Store Connect / TestFlight（Mac App Store）
+        working-directory: ./source-code/enjoycards_app
+        run: |
+          APP_PATH="build/macos/Build/Products/Release/enjoycards_app.app"
+          RELEASE_DIR="build/macos/release"
+          mkdir -p "$RELEASE_DIR"
+          # Mac App Store 不接受直接上传 .app 目录（报 90268/90259/90270/90267），
+          # 需先用 productbuild 打成 .pkg（必须用 3rd Party Mac Developer Installer 证书签名，否则报 90237），
+          # 再通过 altool --type macos 上传。
+          PKG_PATH="$RELEASE_DIR/enjoycards_app-$(date +%Y%m%d-%H%M%S).pkg"
+          echo "=== 生成 Mac App Store 安装包（productbuild，Installer 证书签名） ==="
+          echo "将打包: $APP_PATH"
+          INSTALLER_CERT=$(security find-identity -v | grep "3rd Party Mac Developer Installer" | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ -z "$INSTALLER_CERT" ]; then
+            echo "❌ 未找到 3rd Party Mac Developer Installer 证书，无法签名 pkg"
+            exit 1
+          fi
+          echo "使用 Installer 证书: $INSTALLER_CERT"
+          productbuild --component "$APP_PATH" /Applications --sign "$INSTALLER_CERT" "$PKG_PATH"
+          echo "已生成 pkg: $PKG_PATH ($(du -h "$PKG_PATH" | cut -f1))"
+          echo ""
+          echo "=== 上传 pkg 至 App Store Connect / TestFlight（Mac App Store） ==="
+          xcrun altool --upload-app \
+            --file "$PKG_PATH" \
+            --type macos \
+            --username "${{ secrets.APPLE_ID }}" \
+            --password "${{ secrets.APP_STORE_CONNECT_PASSWORD }}"
+
+      # 结算必须紧跟「产物已被 App Store Connect 收下」这一步，而不是放在 job 末尾：
+      # CFBundleVersion 一旦被 ASC 接受即永久消耗，复用会被硬拒收；
+      # 而多消耗一个号无害。故只要上传成功就立刻落盘，避免后续收尾步骤失败导致号被回收。
+      - name: 📌 结算构建版本号
+        shell: bash
+        run: |
+          set -e
+          BUILD_NUMBER="${{ steps.ver.outputs.build_number }}"
+          VERSION_TRACK_FILE=".github/deploy/version-enjoycards-macos.txt"
+          echo "========================================"
+          echo "📌 结算构建版本号（产物已上传成功）"
+          echo "========================================"
+          echo "待写入计数器: $VERSION_TRACK_FILE = $BUILD_NUMBER"
+
+          COMMIT_MSG="chore: update EnjoyCards macOS build version tracking to $BUILD_NUMBER [skip ci]"
+          # 用 printf | base64 | tr 而非 base64 -w 0：BSD base64（macOS runner）不支持 -w
+          ENCODED_CONTENT=$(printf '%s' "$BUILD_NUMBER" | base64 | tr -d '\n')
+          API_URL="https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/${VERSION_TRACK_FILE}"
+
+          # 读当前 SHA：文件已存在时 PUT 必须带 sha，否则 GitHub 返回 409
+          FILE_SHA=""
+          HTTP_CODE=$(curl -s -o /tmp/api_response.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${GH_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            "$API_URL")
+          if [ "$HTTP_CODE" = "200" ]; then
+            FILE_SHA=$(jq -r '.sha' /tmp/api_response.json)
+            echo "Existing file SHA: $FILE_SHA"
+          else
+            echo "ℹ️  计数器文件尚不存在（HTTP $HTTP_CODE），将新建"
+          fi
+
+          if [ -n "$FILE_SHA" ]; then
+            JSON_BODY=$(jq -n \
+              --arg msg "$COMMIT_MSG" \
+              --arg content "$ENCODED_CONTENT" \
+              --arg sha "$FILE_SHA" \
+              '{message: $msg, content: $content, sha: $sha}')
+          else
+            JSON_BODY=$(jq -n \
+              --arg msg "$COMMIT_MSG" \
+              --arg content "$ENCODED_CONTENT" \
+              '{message: $msg, content: $content}')
+          fi
+
+          # 重试 3 次：产物已被商店接受，此处失败会让该编号下次被复用而遭拒收，必须尽力成功
+          SUCCESS=0
+          for attempt in 1 2 3; do
+            UPDATE_CODE=$(curl -s -o /tmp/update_response.json -w "%{http_code}" \
+              -X PUT \
+              -H "Authorization: Bearer ${GH_PAT}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Content-Type: application/json" \
+              -d "$JSON_BODY" \
+              "$API_URL")
+            if [ "$UPDATE_CODE" = "200" ] || [ "$UPDATE_CODE" = "201" ]; then
+              SUCCESS=1
+              break
+            fi
+            echo "⚠️  写入失败（第 $attempt 次，HTTP $UPDATE_CODE）"
+            cat /tmp/update_response.json || true
+            sleep $((attempt * 3))
+          done
+
+          if [ "$SUCCESS" != "1" ]; then
+            echo ""
+            echo "❌❌❌ 严重：产物已成功上传，但版本计数器写入失败！"
+            echo "    请立即手动把 $VERSION_TRACK_FILE 的内容改为 $BUILD_NUMBER，"
+            echo "    否则下次构建会复用已被商店接受的版本号，导致上传被拒收。"
+            exit 1
+          fi
+
+          echo ""
+          echo "========================================"
+          echo "✅ Version Management Complete: ${{ steps.ver.outputs.version_name }}+$BUILD_NUMBER"
+          echo "========================================"
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+
+      - name: 📦 打包并上传macOS安装包（Artifact，供下载/备份）
+        working-directory: ./source-code/enjoycards_app
+        run: |
+          APP_PATH="build/macos/Build/Products/Release/enjoycards_app.app"
+          RELEASE_DIR="build/macos/release"
+          mkdir -p "$RELEASE_DIR"
+          ditto -c -k --rsrc --keepParent "$APP_PATH" "$RELEASE_DIR/enjoycards_app.app.zip"
+          echo "已生成 zip: $RELEASE_DIR/enjoycards_app.app.zip ($(du -h "$RELEASE_DIR/enjoycards_app.app.zip" | cut -f1))"
+
+      - name: 📦 上传Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: enjoycards-prod-macos
+          path: ./source-code/enjoycards_app/build/macos/release/*.zip
+
+      - name: 📊 构建结果报告
+        run: |
+          echo "========================================"
+          echo "🎉 EnjoyCards macOS (Mac App Store) Build 完成"
+          echo "========================================"
+          echo "状态: ✅ 成功"
+          echo "Runner: ${{ runner.os }}"
+          echo "Xcode: $(xcodebuild -version | head -1)"
+          echo "Flutter: $(flutter --version | head -1)"
+          echo "Bundle ID: com.enjoycards.app (iOS/macOS 同记录)"
+          echo ""
+          echo "版本名:    ${{ steps.ver.outputs.version_name }}"
+          echo "构建号:    ${{ steps.ver.outputs.build_number }}（本平台独立计数器，与 Android/iOS/Windows 无关）"
+          echo "========================================"
+          echo "macOS 上传成功，请前往 App Store Connect 完成提交审核"
+          echo "https://appstoreconnect.apple.com/"
+          echo "========================================"
 
-on:
-  workflow_dispatch:
-
-# 同一平台的构建必须串行：并发运行会先后读到同一个计数器值，产生重复的构建号被 App Store Connect 拒收。
-# 跨平台之间不再需要互斥 —— 各平台只读写自己的计数器文件。
-concurrency:
-  group: enjoycards-macos-build
-  cancel-in-progress: false
-
-jobs:
-  build-macos:
-    runs-on: macos-26
-    name: 构建EnjoyCards macOS App并上传至App Store Connect (Mac App Store)
-    permissions:
-      contents: read
+  # ============================================================
+  # 企业微信通知：成功 / 失败都推送，与其他构建 workflow 保持一致。
+  # Webhook key 来自 Secrets.WECHAT_WORK_WEBHOOK_KEY；未配置时仅通知缺失，不影响构建结果。
+  # ============================================================
+  notify:
+    needs: build-macos
+    if: always()
+    runs-on: ubuntu-latest
     steps:
-      - name: 📋 Checkout 当前打包仓库
-        uses: actions/checkout@v4
-
-      - name: 🛠️ 自动检测并选择最新可用的 Xcode 版本
+      - name: Notify success
+        if: needs.build-macos.result == 'success'
         run: |
-          echo "=== 可用的 Xcode 版本 ==="
-          find /Applications -maxdepth 1 -type d -name "Xcode*.app" | sort -V
-          echo ""
+          MESSAGE="✅ EnjoyCards macOS Release（App Store Connect） 构建成功
 
-          AVAILABLE_XCODE=$(find /Applications -maxdepth 1 -type d -name "Xcode*.app" | sort -V | tail -1)
-          if [ -n "$AVAILABLE_XCODE" ]; then
-            echo "选择最新 Xcode: $AVAILABLE_XCODE"
-            sudo xcode-select -s "$AVAILABLE_XCODE/Contents/Developer"
-          else
-            echo "警告: 未找到 Xcode，使用默认配置"
-          fi
+          App: com.enjoycards.app
+          Commit: ${{ github.sha }}
+          Branch: ${{ github.ref_name }}
 
-          echo ""
-          echo "=== 当前 Xcode 版本 ==="
-          xcodebuild -version
+          View: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          jq -n --arg content "$MESSAGE" '{
+            msgtype: "text",
+            text: { content: $content }
+          }' > /tmp/wechat_msg.json
+          curl -s -X POST "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=${{ secrets.WECHAT_WORK_WEBHOOK_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d @/tmp/wechat_msg.json
 
-      - name: 📥 拉取私有Gitee Flutter代码
+      - name: Notify failure
+        if: needs.build-macos.result == 'failure'
         run: |
-          git clone -b client-release https://oauth2:${{ secrets.GITEE_TOKEN }}@gitee.com/yunhaninfo/enjoy-chinese.git source-code
-          cd source-code
+          MESSAGE="❌ EnjoyCards macOS Release（App Store Connect） 构建失败
 
-      - name: 🔢 Manage macOS Build Version
-        id: ver
-        working-directory: ./source-code
-        run: |
-          set -e
-          echo "========================================"
-          echo "🔢 Managing EnjoyCards macOS Build Version"
-          echo "========================================"
+          App: com.enjoycards.app
+          Commit: ${{ github.sha }}
+          Branch: ${{ github.ref_name }}
 
-          # 版本名：只取 pubspec `version:` 中 `+` 之前的部分（跨平台统一，人工维护）。
-          # pubspec 的 `+N` 只是本地开发默认值，CI 既不读取也不回写 —— 构建号改由本平台
-          # 独立计数器维护，避免各平台互相推高版本号。
-          VERSION_NAME=$(grep "^version:" enjoycards_app/pubspec.yaml | sed 's/version: *//' | cut -d+ -f1 | tr -d ' ')
-          if [ -z "$VERSION_NAME" ]; then
-            echo "❌ 无法从 pubspec.yaml 解析版本名"
-            exit 1
-          fi
-          echo "Version name: $VERSION_NAME"
-
-          # 本平台构建号计数器（部署仓库内，只由本 workflow 读写）
-          VERSION_TRACK_FILE=".github/deploy/version-enjoycards-macos.txt"
-          VERSION_FILE="$GITHUB_WORKSPACE/$VERSION_TRACK_FILE"
-          if [ -f "$VERSION_FILE" ]; then
-            STORED_BUILD=$(cat "$VERSION_FILE" | tr -d ' \n')
-          else
-            STORED_BUILD="0"
-            echo "ℹ️  Version tracking file not found, initializing to 0"
-          fi
-          echo "Stored build number: $STORED_BUILD"
-
-          # 内容非法时直接失败，不静默兜底：否则会把版本号重置，并直接撞上商店拒收
-          case "$STORED_BUILD" in
-            ''|*[!0-9]*)
-              echo "❌ 计数器文件内容非法: '$STORED_BUILD'（$VERSION_TRACK_FILE）"
-              exit 1
-              ;;
-          esac
-
-          # 独立自增：只看本平台的历史值，与其他平台无关
-          NEW_BUILD=$((STORED_BUILD + 1))
-          echo "⬆️  Auto-incrementing: $STORED_BUILD → $NEW_BUILD"
-
-          # 延迟写入：这里只计算 N 并透传，不落盘、不提交。
-          # 计数器由后续「📌 结算构建版本号」步骤在产物上传成功后才写入；
-          # 任何阶段失败都不会消耗版本号，因此也无需回滚。
-          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
-          echo "build_number=$NEW_BUILD"   >> "$GITHUB_OUTPUT"
-
-      - name: 🚀 配置 Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          flutter-version: '3.44.2'
-          channel: stable
-
-      - name: 💾 缓存依赖
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.pub-cache
-            ~/Library/Caches/CocoaPods
-            ./source-code/enjoycards_app/.dart_tool
-            ./source-code/enjoycards_app/build/macos/SourcePackages
-          key: ${{ runner.os }}-enjoycards-macos-flutter-${{ hashFiles('source-code/enjoycards_app/pubspec.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-enjoycards-macos-flutter-
-
-      - name: 📦 安装项目依赖
-        working-directory: ./source-code/enjoycards_app
-        run: flutter pub get
-
-      - name: 🏗️ 生成代码（json_serializable等）
-        working-directory: ./source-code/enjoycards_app
-        run: dart run build_runner build --delete-conflicting-outputs
-
-      - name: 🔑 签名证书导入（Apple Distribution + Mac Installer，手动建库+ACL）
-        # 手动统管而非 import-codesign-certs@v2：其内部生成的 keychain 密码我们拿不到，
-        # 无法对 Installer 证书补 set-partition-list 的 ACL，导致它进库却不成 valid identity。
-        run: |
-          set -e
-          KEYCHAIN_NAME="signing_temp.keychain"
-          KEYCHAIN_FILE="$HOME/Library/Keychains/$KEYCHAIN_NAME"
-          KEYCHAIN_PW="$(uuidgen)"
-
-          echo "=== 创建签名 keychain ==="
-          rm -f "$KEYCHAIN_FILE"
-          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN_FILE"
-          security set-keychain-settings "$KEYCHAIN_FILE"
-          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN_FILE"
-
-          # 同时导入两张证书
-          printf '%s' "$P12_RELEASE_BASE64" | base64 -d > /tmp/p12_dist.p12
-          printf '%s' "$P12_MAC_INSTALLER_BASE64" | base64 -d > /tmp/p12_installer.p12
-
-          echo "=== 导入 Apple Distribution ==="
-          security import /tmp/p12_dist.p12 -k "$KEYCHAIN_FILE" -P "$P12_RELEASE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/productbuild
-
-          echo "=== 导入 Mac Installer ==="
-          security import /tmp/p12_installer.p12 -k "$KEYCHAIN_FILE" -P "$P12_MAC_INSTALLER_PASSWORD" -T /usr/bin/codesign -T /usr/bin/productbuild
-
-          # 关键：设置 ACL/partition-list，让 codesign/productbuild 能读取证书私钥，否则不成 valid identity
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PW" "$KEYCHAIN_FILE"
-
-          # 设为默认，供后续 find-identity / codesign / productbuild 使用
-          security list-keychains -d user -s "$KEYCHAIN_FILE" "$HOME/Library/Keychains/login.keychain-db"
-          security default-keychain -s "$KEYCHAIN_FILE"
-
-          echo "=== [诊断] 导入后全部 valid identities ==="
-          security find-identity -v
-
-          rm -f /tmp/p12_dist.p12 /tmp/p12_installer.p12
-        env:
-          P12_RELEASE_BASE64: ${{ secrets.P12_RELEASE_BASE64 }}
-          P12_RELEASE_PASSWORD: ${{ secrets.P12_RELEASE_PASSWORD }}
-          P12_MAC_INSTALLER_BASE64: ${{ secrets.P12_MAC_INSTALLER_BASE64 }}
-          P12_MAC_INSTALLER_PASSWORD: ${{ secrets.P12_MAC_INSTALLER_PASSWORD }}
-
-      - name: 📄 导入Mac App Store Provisioning Profile（EnjoyCards macOS）
-        run: |
-          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-          # macOS 的 MAS profile 用 .provisionprofile 扩展；printf '%s' 避免换行/转义污染 base64 解码
-          printf '%s' "$PROV_ENJOYCARDS_MACOS_BASE64" | base64 -d \
-            > ~/Library/MobileDevice/Provisioning\ Profiles/enjoycards_macos.provisionprofile
-          echo "导入完成，文件大小：$(stat -f %z ~/Library/MobileDevice/Provisioning\ Profiles/enjoycards_macos.provisionprofile) 字节"
-          file ~/Library/MobileDevice/Provisioning\ Profiles/enjoycards_macos.provisionprofile
-        env:
-          PROV_ENJOYCARDS_MACOS_BASE64: ${{ secrets.PROV_ENJOYCARDS_MACOS_RELEASE_BASE64 }}
-
-      - name: 🔍 验证 Provisioning Profile 内容与Bundle ID
-        run: |
-          PROFILE_PATH=~/Library/MobileDevice/Provisioning\ Profiles/enjoycards_macos.provisionprofile
-          security cms -D -i "$PROFILE_PATH" > /tmp/profile.plist
-          PROFILE_NAME=$(/usr/libexec/PlistBuddy -c "Print :Name" /tmp/profile.plist)
-          APP_ID=$(/usr/libexec/PlistBuddy -c "Print :Entitlements:com.apple.application-identifier" /tmp/profile.plist)
-          echo "Profile Name: $PROFILE_NAME"
-          echo "App ID: $APP_ID"
-          if [[ "$APP_ID" == *"com.enjoycards.app" ]]; then
-            echo "✅ Profile 绑定 com.enjoycards.app"
-          else
-            echo "❌ Profile App ID 不匹配: $APP_ID (期望包含 com.enjoycards.app)"
-            exit 1
-          fi
-          # 输出 profile 名供后续 PROVISIONING_PROFILE_SPECIFIER 使用
-          echo "PROV_ENJOYCARDS_MACOS_RELEASE_NAME=$PROFILE_NAME"
-
-      - name: ✏️ 配置macOS工程的Bundle ID与签名（对齐 Mac App Store 同记录 com.enjoycards.app）
-        working-directory: ./source-code/enjoycards_app
-        run: |
-          PROV_NAME="$PROV_ENJOYCARDS_MACOS_RELEASE_NAME"
-          echo "将使用 Provisioning Profile: $PROV_NAME"
-
-          # 1) bundle id 统一为 com.enjoycards.app（与 ASC 中 enjoycards 的 iOS/macOS 记录一致）
-          if ! grep -q 'PRODUCT_BUNDLE_IDENTIFIER = com.enjoycards.app;' macos/Runner/Configs/AppInfo.xcconfig; then
-            perl -i -pe 's/PRODUCT_BUNDLE_IDENTIFIER = .*/PRODUCT_BUNDLE_IDENTIFIER = com.enjoycards.app;/' macos/Runner/Configs/AppInfo.xcconfig
-          fi
-          echo "=== AppInfo.xcconfig Bundle ID ==="
-          grep PRODUCT_BUNDLE_IDENTIFIER macos/Runner/Configs/AppInfo.xcconfig
-
-          # 2) Release 构建配置写入 MAS 签名设置（写进 Release.xcconfig，构建时生效）
-          XC=macos/Runner/Configs/Release.xcconfig
-          ensure() { grep -qF "$1" "$XC" || echo "$1" >> "$XC"; }
-          ensure "CODE_SIGN_STYLE = Manual"
-          ensure "DEVELOPMENT_TEAM = JU3D9VJFCN"
-          ensure "CODE_SIGN_IDENTITY = \"Apple Distribution\""
-          ensure "PROVISIONING_PROFILE_SPECIFIER = $PROV_NAME"
-          echo "=== Release.xcconfig 签名配置 ==="
-          cat "$XC"
-        env:
-          PROV_ENJOYCARDS_MACOS_RELEASE_NAME: ${{ secrets.PROV_ENJOYCARDS_MACOS_RELEASE_NAME }}
-
-      - name: 🔨 编译签名macOS App（Release, App Store）
-        working-directory: ./source-code/enjoycards_app
-        run: |
-          echo "=== 开始构建 EnjoyCards macOS App ==="
-          # CFBundleVersion 由 --build-number 决定，构建号来自本平台独立计数器
-          # （见 Manage macOS Build Version 步骤）
-          flutter build macos \
-            --release \
-            --build-number=${{ steps.ver.outputs.build_number }} \
-            --dart-define=ENV=prod \
-            --dart-define=PROD_API_HOST=${{ secrets.PROD_API_HOST }} \
-            --dart-define=REVENUECAT_API_KEY=${{ secrets.REVENUECAT_ENJOYCARDS_KEY_IOS }}
-          echo ""
-          echo "=== macOS App 构建完成 ==="
-
-      - name: ✅ 校验产物签名与Bundle ID
-        working-directory: ./source-code/enjoycards_app
-        run: |
-          APP_PATH="build/macos/Build/Products/Release/enjoycards_app.app"
-          if [ ! -d "$APP_PATH" ]; then
-            echo "❌ 未找到产物: $APP_PATH"
-            ls -la build/macos/Build/Products/Release/ || true
-            exit 1
-          fi
-          echo "=== 产物大小 ==="
-          du -sh "$APP_PATH"
-          echo ""
-          echo "=== Bundle ID ==="
-          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP_PATH/Contents/Info.plist")
-          echo "Bundle ID: $BUNDLE_ID"
-          if [ "$BUNDLE_ID" = "com.enjoycards.app" ]; then
-            echo "✅ Bundle ID 正确"
-          else
-            echo "❌ Bundle ID 不匹配，期望 com.enjoycards.app"
-            exit 1
-          fi
-          echo ""
-          echo "=== 内嵌版本号 ==="
-          MAC_INFO="$APP_PATH/Contents/Info.plist"
-          SHORT_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$MAC_INFO")
-          BUILD_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$MAC_INFO")
-          echo "CFBundleShortVersionString: $SHORT_VERSION"
-          echo "CFBundleVersion:            $BUILD_VERSION"
-          # 断言产物真的带上了本平台计数器号，兜住 "--build-number 被忽略/被工程配置覆盖" 这类静默失效
-          EXPECTED_NAME="${{ steps.ver.outputs.version_name }}"
-          EXPECTED_BUILD="${{ steps.ver.outputs.build_number }}"
-          if [ "$BUILD_VERSION" != "$EXPECTED_BUILD" ]; then
-            echo "❌ CFBundleVersion=$BUILD_VERSION，期望 $EXPECTED_BUILD"
-            exit 1
-          fi
-          if [ "$SHORT_VERSION" != "$EXPECTED_NAME" ]; then
-            echo "❌ CFBundleShortVersionString=$SHORT_VERSION，期望 $EXPECTED_NAME"
-            exit 1
-          fi
-          echo "✅ 产物内嵌版本号与计数器一致：$SHORT_VERSION ($BUILD_VERSION)"
-          echo ""
-          echo "=== 签名验证 ==="
-          codesign --verify --deep --strict "$APP_PATH" && echo "✅ 代码签名验证通过"
-          codesign -dv --verbose=4 "$APP_PATH" 2>&1 | grep -E "Identifier|TeamIdentifier|flags|Authority" | head
-          echo ""
-          echo "=== Entitlements（沙箱+联网，App Store 必需） ==="
-          codesign -d --entitlements - --xml "$APP_PATH" 2>/dev/null > /tmp/macos_entitlements.plist || true
-          SAND_MISSING=false
-          for key in com.apple.security.app-sandbox com.apple.security.network.client; do
-            if grep -q "$key" /tmp/macos_entitlements.plist 2>/dev/null; then
-              echo "✅ 包含 $key"
-            else
-              echo "❌ 缺少 $key（Mac App Store 上架必需）"
-              SAND_MISSING=true
-            fi
-          done
-          if [ "$SAND_MISSING" = "true" ]; then
-            echo "❌ Entitlements 未正确嵌入，Mac App Store 会拒绝上传（90296）。"
-            echo "确认 Runner Release target 已设 CODE_SIGN_ENTITLEMENTS=Runner/Release.entitlements 且签名开启了该文件。"
-            exit 1
-          fi
-
-      - name: 📤 上传到 App Store Connect / TestFlight（Mac App Store）
-        working-directory: ./source-code/enjoycards_app
-        run: |
-          APP_PATH="build/macos/Build/Products/Release/enjoycards_app.app"
-          RELEASE_DIR="build/macos/release"
-          mkdir -p "$RELEASE_DIR"
-          # Mac App Store 不接受直接上传 .app 目录（报 90268/90259/90270/90267），
-          # 需先用 productbuild 打成 .pkg（必须用 3rd Party Mac Developer Installer 证书签名，否则报 90237），
-          # 再通过 altool --type macos 上传。
-          PKG_PATH="$RELEASE_DIR/enjoycards_app-$(date +%Y%m%d-%H%M%S).pkg"
-          echo "=== 生成 Mac App Store 安装包（productbuild，Installer 证书签名） ==="
-          echo "将打包: $APP_PATH"
-          INSTALLER_CERT=$(security find-identity -v | grep "3rd Party Mac Developer Installer" | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
-          if [ -z "$INSTALLER_CERT" ]; then
-            echo "❌ 未找到 3rd Party Mac Developer Installer 证书，无法签名 pkg"
-            exit 1
-          fi
-          echo "使用 Installer 证书: $INSTALLER_CERT"
-          productbuild --component "$APP_PATH" /Applications --sign "$INSTALLER_CERT" "$PKG_PATH"
-          echo "已生成 pkg: $PKG_PATH ($(du -h "$PKG_PATH" | cut -f1))"
-          echo ""
-          echo "=== 上传 pkg 至 App Store Connect / TestFlight（Mac App Store） ==="
-          xcrun altool --upload-app \
-            --file "$PKG_PATH" \
-            --type macos \
-            --username "${{ secrets.APPLE_ID }}" \
-            --password "${{ secrets.APP_STORE_CONNECT_PASSWORD }}"
-
-      # 结算必须紧跟「产物已被 App Store Connect 收下」这一步，而不是放在 job 末尾：
-      # CFBundleVersion 一旦被 ASC 接受即永久消耗，复用会被硬拒收；
-      # 而多消耗一个号无害。故只要上传成功就立刻落盘，避免后续收尾步骤失败导致号被回收。
-      - name: 📌 结算构建版本号
-        shell: bash
-        run: |
-          set -e
-          BUILD_NUMBER="${{ steps.ver.outputs.build_number }}"
-          VERSION_TRACK_FILE=".github/deploy/version-enjoycards-macos.txt"
-          echo "========================================"
-          echo "📌 结算构建版本号（产物已上传成功）"
-          echo "========================================"
-          echo "待写入计数器: $VERSION_TRACK_FILE = $BUILD_NUMBER"
-
-          COMMIT_MSG="chore: update EnjoyCards macOS build version tracking to $BUILD_NUMBER [skip ci]"
-          # 用 printf | base64 | tr 而非 base64 -w 0：BSD base64（macOS runner）不支持 -w
-          ENCODED_CONTENT=$(printf '%s' "$BUILD_NUMBER" | base64 | tr -d '\n')
-          API_URL="https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/${VERSION_TRACK_FILE}"
-
-          # 读当前 SHA：文件已存在时 PUT 必须带 sha，否则 GitHub 返回 409
-          FILE_SHA=""
-          HTTP_CODE=$(curl -s -o /tmp/api_response.json -w "%{http_code}" \
-            -H "Authorization: Bearer ${GH_PAT}" \
-            -H "Accept: application/vnd.github+json" \
-            "$API_URL")
-          if [ "$HTTP_CODE" = "200" ]; then
-            FILE_SHA=$(jq -r '.sha' /tmp/api_response.json)
-            echo "Existing file SHA: $FILE_SHA"
-          else
-            echo "ℹ️  计数器文件尚不存在（HTTP $HTTP_CODE），将新建"
-          fi
-
-          if [ -n "$FILE_SHA" ]; then
-            JSON_BODY=$(jq -n \
-              --arg msg "$COMMIT_MSG" \
-              --arg content "$ENCODED_CONTENT" \
-              --arg sha "$FILE_SHA" \
-              '{message: $msg, content: $content, sha: $sha}')
-          else
-            JSON_BODY=$(jq -n \
-              --arg msg "$COMMIT_MSG" \
-              --arg content "$ENCODED_CONTENT" \
-              '{message: $msg, content: $content}')
-          fi
-
-          # 重试 3 次：产物已被商店接受，此处失败会让该编号下次被复用而遭拒收，必须尽力成功
-          SUCCESS=0
-          for attempt in 1 2 3; do
-            UPDATE_CODE=$(curl -s -o /tmp/update_response.json -w "%{http_code}" \
-              -X PUT \
-              -H "Authorization: Bearer ${GH_PAT}" \
-              -H "Accept: application/vnd.github+json" \
-              -H "Content-Type: application/json" \
-              -d "$JSON_BODY" \
-              "$API_URL")
-            if [ "$UPDATE_CODE" = "200" ] || [ "$UPDATE_CODE" = "201" ]; then
-              SUCCESS=1
-              break
-            fi
-            echo "⚠️  写入失败（第 $attempt 次，HTTP $UPDATE_CODE）"
-            cat /tmp/update_response.json || true
-            sleep $((attempt * 3))
-          done
-
-          if [ "$SUCCESS" != "1" ]; then
-            echo ""
-            echo "❌❌❌ 严重：产物已成功上传，但版本计数器写入失败！"
-            echo "    请立即手动把 $VERSION_TRACK_FILE 的内容改为 $BUILD_NUMBER，"
-            echo "    否则下次构建会复用已被商店接受的版本号，导致上传被拒收。"
-            exit 1
-          fi
-
-          echo ""
-          echo "========================================"
-          echo "✅ Version Management Complete: ${{ steps.ver.outputs.version_name }}+$BUILD_NUMBER"
-          echo "========================================"
-        env:
-          GH_PAT: ${{ secrets.GH_PAT }}
-
-      - name: 📦 打包并上传macOS安装包（Artifact，供下载/备份）
-        working-directory: ./source-code/enjoycards_app
-        run: |
-          APP_PATH="build/macos/Build/Products/Release/enjoycards_app.app"
-          RELEASE_DIR="build/macos/release"
-          mkdir -p "$RELEASE_DIR"
-          ditto -c -k --rsrc --keepParent "$APP_PATH" "$RELEASE_DIR/enjoycards_app.app.zip"
-          echo "已生成 zip: $RELEASE_DIR/enjoycards_app.app.zip ($(du -h "$RELEASE_DIR/enjoycards_app.app.zip" | cut -f1))"
-
-      - name: 📦 上传Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: enjoycards-prod-macos
-          path: ./source-code/enjoycards_app/build/macos/release/*.zip
-
-      - name: 📊 构建结果报告
-        run: |
-          echo "========================================"
-          echo "🎉 EnjoyCards macOS (Mac App Store) Build 完成"
-          echo "========================================"
-          echo "状态: ✅ 成功"
-          echo "Runner: ${{ runner.os }}"
-          echo "Xcode: $(xcodebuild -version | head -1)"
-          echo "Flutter: $(flutter --version | head -1)"
-          echo "Bundle ID: com.enjoycards.app (iOS/macOS 同记录)"
-          echo ""
-          echo "版本名:    ${{ steps.ver.outputs.version_name }}"
-          echo "构建号:    ${{ steps.ver.outputs.build_number }}（本平台独立计数器，与 Android/iOS/Windows 无关）"
-          echo "========================================"
-          echo "macOS 上传成功，请前往 App Store Connect 完成提交审核"
-          echo "https://appstoreconnect.apple.com/"
-          echo "========================================"
+          Check: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          jq -n --arg content "$MESSAGE" '{
+            msgtype: "text",
+            text: { content: $content }
+          }' > /tmp/wechat_msg.json
+          curl -s -X POST "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=${{ secrets.WECHAT_WORK_WEBHOOK_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d @/tmp/wechat_msg.json

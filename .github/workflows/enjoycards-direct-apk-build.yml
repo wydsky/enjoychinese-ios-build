@@ -312,4 +312,49 @@ jobs:
           echo "2. 在后端 app_version 表登记（package_name = com.enjoycards.app），"
           echo "   version_code 必须填 ${{ steps.ver.outputs.build_number }}，"
           echo "   并填写 file_url、file_size、md5、sha256（md5 为 NOT NULL）"
-          echo "========================================"
+          echo "========================================"
+
+  # ============================================================
+  # 企业微信通知：成功 / 失败都推送，与其他构建 workflow 保持一致。
+  # Webhook key 来自 Secrets.WECHAT_WORK_WEBHOOK_KEY；未配置时仅通知缺失，不影响构建结果。
+  # ============================================================
+  notify:
+    needs: build-direct-apk
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify success
+        if: needs.build-direct-apk.result == 'success'
+        run: |
+          MESSAGE="✅ EnjoyCards Android 官网直装 APK 构建成功
+
+          App: com.enjoycards.app
+          Commit: ${{ github.sha }}
+          Branch: ${{ github.ref_name }}
+
+          View: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          jq -n --arg content "$MESSAGE" '{
+            msgtype: "text",
+            text: { content: $content }
+          }' > /tmp/wechat_msg.json
+          curl -s -X POST "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=${{ secrets.WECHAT_WORK_WEBHOOK_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d @/tmp/wechat_msg.json
+
+      - name: Notify failure
+        if: needs.build-direct-apk.result == 'failure'
+        run: |
+          MESSAGE="❌ EnjoyCards Android 官网直装 APK 构建失败
+
+          App: com.enjoycards.app
+          Commit: ${{ github.sha }}
+          Branch: ${{ github.ref_name }}
+
+          Check: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          jq -n --arg content "$MESSAGE" '{
+            msgtype: "text",
+            text: { content: $content }
+          }' > /tmp/wechat_msg.json
+          curl -s -X POST "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=${{ secrets.WECHAT_WORK_WEBHOOK_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d @/tmp/wechat_msg.json

@@ -16,6 +16,11 @@
 #   3) POST /api/open/v1/apk/publish  → 登记 app_version（官网随即可见）
 #   4) GET  /api/open/v1/apk/latest   → 自检发布结果
 #
+# 可选环境变量：
+#   OPEN_API_UPDATE_TYPE  更新类型：1 普通更新（默认）、2 强制更新。
+#                         自动化发布默认走普通更新；确需强制更新时再显式设为 2，
+#                         或发布后在管理平台「APK 管理」中改更新类型。
+#
 # 依赖：curl、openssl、jq、sha256sum/md5sum（GitHub ubuntu-latest 自带）
 # ============================================================
 set -euo pipefail
@@ -47,6 +52,13 @@ fail() { echo "[open-api][ERROR] $*" >&2; exit 1; }
 command -v curl >/dev/null || fail "缺少 curl"
 command -v openssl >/dev/null || fail "缺少 openssl"
 command -v jq >/dev/null || fail "缺少 jq"
+
+# 更新类型：默认普通更新（1），仅显式配置 OPEN_API_UPDATE_TYPE=2 时才为强制更新
+UPDATE_TYPE="${OPEN_API_UPDATE_TYPE:-1}"
+case "$UPDATE_TYPE" in
+  1|2) ;;
+  *) fail "OPEN_API_UPDATE_TYPE 只能是 1（普通更新）或 2（强制更新），当前为 '$UPDATE_TYPE'" ;;
+esac
 
 [ -f "$PKG_FILE" ] || fail "安装包文件不存在：$PKG_FILE"
 
@@ -143,13 +155,14 @@ jq -n \
   --arg md5 "$PKG_MD5" \
   --arg sha256 "$PKG_SHA256" \
   --arg updateDesc "$UPDATE_DESC" \
+  --argjson updateType "$UPDATE_TYPE" \
   '{appName:$appName, packageName:$packageName, versionName:$versionName,
     versionCode:$versionCode, fileUrl:$fileUrl, fileSize:$fileSize,
     md5:$md5, sha256:$sha256, updateDesc:$updateDesc,
-    updateType:1, minSdk:21, status:1}' > "$BODY_FILE"
+    updateType:$updateType, minSdk:21, status:1}' > "$BODY_FILE"
 
 BODY_SHA256=$(sha256sum "$BODY_FILE" | awk '{print $1}')
-log "发布版本 ${VERSION_NAME} (${VERSION_CODE})..."
+log "发布版本 ${VERSION_NAME} (${VERSION_CODE})，更新类型=${UPDATE_TYPE}（1 普通 / 2 强制）..."
 HTTP_CODE=$(sign_and_call "POST" "$PUBLISH_PATH" "" "$BODY_SHA256" \
   -H "Content-Type: application/json" --data-binary "@${BODY_FILE}")
 
