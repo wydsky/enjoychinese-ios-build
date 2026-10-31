@@ -1,0 +1,7 @@
+# GitHub Actions workflow 强制 LF
+# 原因：runner 上 bash 解析 run: | 脚本时，CRLF 会让行尾反斜杠续行失效，
+#       multi-line 命令被拆成独立命令行（如报 "--release: command not found"）
+.github/workflows/*.yml text eol=lf
+
+# workflow 调用的脚本同样必须 LF
+deploy/ios-android-build/scripts/*.sh text eol=lf

@@ -1,443 +1,443 @@
-name: EnjoyCards Windows Portable Build (官网下载 · Inno Setup 安装包)
-
-# 用途：构建 EnjoyCards Windows 桌面版，用 Inno Setup 打包成「带安装向导的安装包」，
-# 上传为 Artifact 并（配置 OPEN_API_* Secrets 后）通过开放接口自动上传 COS、
-# 在后端 app_version 表登记版本（package_name = com.enjoycards.app.windows），
-# 官网的 /js/download.js 据此展示版本、文件大小与 SHA-256 并即时可下载。
-# 未配置 Secrets 时自动发布步骤跳过，仍按原方式下载 Artifact 手工发布。
-#
-# 与 enjoycards-windows-build.yml 的分工：
-#   - 本文件          → 官网直接下载用的 Inno Setup 安装包（安装向导/快捷方式/卸载入口）
-#   - enjoycards-windows-build.yml → Microsoft Store 上架用的 MSIX
-# 两者共用同一份 Flutter 代码，但各自维护独立的版本 tracking 文件（互不干扰）。
-
-on:
-  workflow_dispatch:
-
-# 同一平台的构建必须串行：并发运行会先后读到同一个计数器值，产生重复的版本号。
-# 跨平台之间不再需要互斥 —— 各平台只读写自己的计数器文件。
-concurrency:
-  group: enjoycards-windows-portable-build
-  cancel-in-progress: false
-
-jobs:
-  build-windows-portable:
-    runs-on: windows-latest
-    name: 构建EnjoyCards Windows便携版（Inno Setup 安装包，供官网下载）
-    permissions:
-      contents: read
-    # 开放接口 AK/SK（GitHub Secrets 提供）；未配置时下方自动发布步骤会跳过
-    env:
-      OPEN_API_BASE_URL: ${{ secrets.OPEN_API_BASE_URL }}
-      OPEN_API_AK: ${{ secrets.OPEN_API_AK }}
-      OPEN_API_SK: ${{ secrets.OPEN_API_SK }}
-    steps:
-      - name: 📋 Checkout 当前打包仓库
-        uses: actions/checkout@v4
-
-      - name: 📥 拉取私有Gitee Flutter代码
-        shell: bash
-        run: |
-          git clone -b client-release https://oauth2:${{ secrets.GITEE_TOKEN }}@gitee.com/yunhaninfo/enjoy-chinese.git source-code
-          cd source-code
-
-      - name: 🔢 Manage Windows Portable Build Version
-        id: ver
-        working-directory: ./source-code
-        shell: bash
-        run: |
-          set -e
-          echo "========================================"
-          echo "🔢 Managing EnjoyCards Windows Portable Build Version"
-          echo "========================================"
-
-          # 版本名：只取 pubspec `version:` 中 `+` 之前的部分（跨平台统一，人工维护）。
-          # pubspec 的 `+N` 只是本地开发默认值，CI 既不读取也不回写 —— 构建号改由本平台
-          # 独立计数器维护，避免各平台互相推高版本号。
-          VERSION_NAME=$(grep "^version:" enjoycards_app/pubspec.yaml | sed 's/version: *//' | cut -d+ -f1 | tr -d ' ')
-          if [ -z "$VERSION_NAME" ]; then
-            echo "❌ 无法从 pubspec.yaml 解析版本名"
-            exit 1
-          fi
-          echo "Version name: $VERSION_NAME"
-
-          # 本平台构建号计数器（部署仓库内，只由本 workflow 读写）
-          VERSION_TRACK_FILE=".github/deploy/version-enjoycards-windows-portable.txt"
-          VERSION_FILE="$GITHUB_WORKSPACE/$VERSION_TRACK_FILE"
-          if [ -f "$VERSION_FILE" ]; then
-            STORED_BUILD=$(cat "$VERSION_FILE" | tr -d ' \n')
-          else
-            STORED_BUILD="0"
-            echo "ℹ️  Version tracking file not found, initializing to 0"
-          fi
-          echo "Stored build number: $STORED_BUILD"
-
-          # 内容非法时直接失败，不静默兜底：否则会把版本号重置
-          case "$STORED_BUILD" in
-            ''|*[!0-9]*)
-              echo "❌ 计数器文件内容非法: '$STORED_BUILD'（$VERSION_TRACK_FILE）"
-              exit 1
-              ;;
-          esac
-
-          # 独立自增：只看本平台的历史值，与其他平台无关
-          NEW_BUILD=$((STORED_BUILD + 1))
-          echo "⬆️  Auto-incrementing: $STORED_BUILD → $NEW_BUILD"
-
-          # 延迟写入：这里只计算 N 并透传，不落盘、不提交。
-          # 计数器由后续「📌 结算构建版本号」步骤在产物上传成功后才写入；
-          # 任何阶段失败都不会消耗版本号，因此也无需回滚。
-          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
-          echo "build_number=$NEW_BUILD"   >> "$GITHUB_OUTPUT"
-
-      - name: 🚀 配置 Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          flutter-version: '3.44.2'
-          channel: stable
-
-      - name: 💾 缓存依赖
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/AppData/Local/Pub/Cache
-            ./source-code/enjoycards_app/.dart_tool
-            ./source-code/enjoycards_app/build/windows
-          key: ${{ runner.os }}-enjoycards-windows-portable-flutter-${{ hashFiles('source-code/enjoycards_app/pubspec.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-enjoycards-windows-portable-flutter-
-
-      - name: 📦 安装项目依赖
-        working-directory: ./source-code/enjoycards_app
-        run: flutter pub get
-
-      - name: 🏗️ 生成代码（json_serializable等）
-        working-directory: ./source-code/enjoycards_app
-        run: dart run build_runner build --delete-conflicting-outputs
-
-      - name: 🔨 编译 Windows Release
-        working-directory: ./source-code/enjoycards_app
-        shell: bash
-        run: |
-          echo "=== 开始构建 EnjoyCards Windows 桌面版 ==="
-          # 说明：不注入 REVENUECAT_API_KEY —— RevenueCat 在 Windows 上未启用
-          # （见 lib/services/revenuecat_service.dart: Platform.isIOS/MacOS/Android 之外直接 return）
-          #
-          # 本平台构建号由独立计数器维护（见 Manage Windows Portable Build Version）。
-          # 构建前把它写进 pubspec 的 `+N`，让 exe 内嵌版本与安装包版本、后端登记
-          # 的 versionCode 同源；否则客户端拿 1.0.2+44 去比后端的计数器值，会永远误判。
-          sed -i "s/^version:.*/version: ${{ steps.ver.outputs.version_name }}+${{ steps.ver.outputs.build_number }}/" pubspec.yaml
-          grep '^version:' pubspec.yaml
-          # DIST_CHANNEL=direct 打开应用内更新（仅官网直装包，MSIX/商店包保持关闭）
-          flutter build windows \
-            --release \
-            --dart-define=ENV=prod \
-            --dart-define=DIST_CHANNEL=direct \
-            --dart-define=PROD_API_HOST=${{ secrets.PROD_API_HOST }}
-          echo ""
-          echo "=== Windows 构建完成 ==="
-
-      - name: ✅ 校验产物（定位 Release 目录）
-        id: locate
-        working-directory: ./source-code/enjoycards_app
-        shell: pwsh
-        run: |
-          # Flutter 3.10+ 输出在 build/windows/x64/runner/Release；旧版在 build/windows/runner/Release。
-          # 这里按文件名反查，避免因 Flutter 版本差异导致路径写死而失败。
-          $exe = Get-ChildItem -Path 'build/windows' -Recurse -Filter 'enjoycards_app.exe' -File -ErrorAction SilentlyContinue |
-                 Where-Object { $_.DirectoryName -match 'Release' } |
-                 Select-Object -First 1
-          if (-not $exe) {
-            Write-Host "❌ 未找到 enjoycards_app.exe，build/windows 目录内容："
-            if (Test-Path 'build/windows') { Get-ChildItem -Path 'build/windows' -Recurse -Depth 3 | Select-Object FullName }
-            exit 1
-          }
-          $releaseDir = $exe.DirectoryName
-          Write-Host "✅ Release 目录: $releaseDir"
-          Write-Host "=== 目录内容（前 40 项）==="
-          Get-ChildItem -Path $releaseDir | Select-Object -First 40 Name, Length
-          Write-Host "=== 目录总大小 ==="
-          $sizeMb = [math]::Round(((Get-ChildItem $releaseDir -Recurse -File | Measure-Object Length -Sum).Sum / 1MB), 1)
-          Write-Host "$sizeMb MB"
-
-          # 关键文件必须在，否则用户下载后无法运行
-          foreach ($required in @('enjoycards_app.exe', 'flutter_windows.dll', 'data')) {
-            if (Test-Path (Join-Path $releaseDir $required)) {
-              Write-Host "✅ 包含 $required"
-            } else {
-              Write-Host "❌ 缺少 $required —— 打包后会无法运行"
-              exit 1
-            }
-          }
-
-          "release_dir=$releaseDir" >> $env:GITHUB_OUTPUT
-
-      - name: 📦 打包为安装包（Inno Setup）
-        id: package
-        working-directory: ./source-code/enjoycards_app
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          $releaseDir = '${{ steps.locate.outputs.release_dir }}'
-          # 版本号来自本平台独立计数器（见 Manage Windows Portable Build Version 步骤），
-          # 不再从 pubspec.yaml 拼接 —— 否则各平台会互相推高版本号。
-          $versionName = '${{ steps.ver.outputs.version_name }}'
-          $buildNumber = '${{ steps.ver.outputs.build_number }}'
-          $fileVersion = "$versionName.$buildNumber"
-          Write-Host "打包版本: $fileVersion"
-
-          $outDir = Join-Path (Get-Location) 'build/windows/site'
-          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
-          # build/windows 会被 actions/cache 还原，上一版的安装包与校验文件会被一起带回；
-          # 不清理会导致上传的 artifact 混入多个版本的 exe，官网登记校验值将对不上。
-          Remove-Item -Path (Join-Path $outDir 'EnjoyCards-Setup-*.exe*') -Force -ErrorAction SilentlyContinue
-          $exeName = "EnjoyCards-Setup-$fileVersion.exe"
-          $outExe  = Join-Path $outDir $exeName
-          $issPath = Join-Path $outDir 'enjoycards.iss'
-
-          # 1) 定位 Inno Setup 编译器（runner 镜像预装；先查 PATH 再查默认安装目录，最后 choco 兜底）
-          $iscc = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source
-          if (-not $iscc) {
-            foreach ($p in @(
-              "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
-              "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
-              "$env:ProgramFiles\Inno Setup 5\ISCC.exe",
-              "${env:ProgramFiles(x86)}\Inno Setup 5\ISCC.exe"
-            )) {
-              if (Test-Path $p) { $iscc = $p; break }
-            }
-          }
-          if (-not $iscc -and (Test-Path 'C:\ProgramData\chocolatey\lib')) {
-            $iscc = Get-ChildItem 'C:\ProgramData\chocolatey\lib' -Recurse -Filter 'ISCC.exe' -File -ErrorAction SilentlyContinue |
-                    Select-Object -First 1 -ExpandProperty FullName
-          }
-          if (-not $iscc) { throw '未找到 ISCC.exe（Inno Setup 编译器），无法生成安装包' }
-          Write-Host "ISCC: $iscc"
-
-          # 2) 生成 Inno Setup 脚本（安装向导 / 目录选择 / 快捷方式 / 卸载入口 / 装完可自动运行）
-          #    脚本在 CI 内动态生成、不落地到 Flutter 仓库；内容保持纯 ASCII，避免编码问题。
-          $iconPath = Join-Path (Get-Location) 'windows/runner/resources/app_icon.ico'
-          $iconLine = if (Test-Path $iconPath) { "SetupIconFile=$iconPath" } else { '' }
-          $islPath  = Join-Path (Split-Path $iscc) 'Languages\ChineseSimplified.isl'
-          $cnLine   = if (Test-Path $islPath) { 'Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"' } else { '' }
-          $outputBase = $exeName -replace '\.exe$', ''
-
-          $issLines = @(
-            '; generated by CI - do not edit by hand'
-            '[Setup]'
-            'AppId={{8F1D2A54-3C6B-4E7A-9D21-5B0C7E3A1F42}'
-            'AppName=EnjoyCards'
-            "AppVersion=$fileVersion"
-            'AppPublisher=EnjoyCards'
-            'DefaultDirName={autopf}\EnjoyCards'
-            'DefaultGroupName=EnjoyCards'
-            'DisableProgramGroupPage=yes'
-            'AllowNoIcons=yes'
-            'PrivilegesRequired=lowest'
-            'ArchitecturesInstallIn64BitMode=x64'
-            'Compression=lzma2/max'
-            'SolidCompression=yes'
-            'WizardStyle=modern'
-            # 应用内静默更新由客户端拉起安装包：安装前自动关闭仍在运行的 EnjoyCards，
-            # 避免 exe 被占用导致覆盖失败。
-            'CloseApplications=yes'
-            'RestartApplications=no'
-            'UninstallDisplayName=EnjoyCards'
-            'UninstallDisplayIcon={app}\enjoycards_app.exe'
-            "OutputDir=$outDir"
-            "OutputBaseFilename=$outputBase"
-          )
-          if ($iconLine) { $issLines += $iconLine }
-          $issLines += @(
-            ''
-            '[Languages]'
-            'Name: "english"; MessagesFile: "compiler:Default.isl"'
-          )
-          if ($cnLine) { $issLines += $cnLine }
-          $issLines += @(
-            ''
-            '[Tasks]'
-            'Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: checkedonce'
-            ''
-            '[Files]'
-            "Source: `"$releaseDir\*`"; DestDir: `"{app}`"; Flags: ignoreversion recursesubdirs createallsubdirs"
-            ''
-            '[Icons]'
-            'Name: "{autoprograms}\EnjoyCards"; Filename: "{app}\enjoycards_app.exe"'
-            'Name: "{autodesktop}\EnjoyCards"; Filename: "{app}\enjoycards_app.exe"; Tasks: desktopicon'
-            ''
-            '[Run]'
-            'Filename: "{app}\enjoycards_app.exe"; Description: "{cm:LaunchProgram,EnjoyCards}"; Flags: nowait postinstall skipifsilent'
-            # 应用内静默更新：安装完成后自动拉起应用（仅在 /SILENT 模式下生效）
-            'Filename: "{app}\enjoycards_app.exe"; Flags: nowait; Check: IsSilentMode'
-            ''
-            '[Code]'
-            'function IsSilentMode: Boolean;'
-            'begin'
-            '  Result := WizardSilent;'
-            'end;'
-          )
-          [System.IO.File]::WriteAllLines($issPath, $issLines, (New-Object System.Text.UTF8Encoding($true)))
-          Write-Host "Inno Setup 脚本: $issPath"
-
-          # 3) 剔除调试符号，减小体积
-          Get-ChildItem -Path $releaseDir -Recurse -Include '*.pdb' -File | Remove-Item -Force -ErrorAction SilentlyContinue
-
-          # 4) 编译安装包（ISCC 按脚本把 Release 目录整体打进安装包）
-          & $iscc $issPath
-          if ($LASTEXITCODE -ne 0) { throw "Inno Setup 编译失败，退出码 $LASTEXITCODE" }
-          if (-not (Test-Path $outExe)) { throw "未生成安装包: $outExe" }
-
-          $exeSize = (Get-Item $outExe).Length
-          Write-Host "✅ 已生成安装包: $outExe ($([math]::Round($exeSize / 1MB, 1)) MB)"
-
-          # 5) 计算 SHA-256（官网展示的 checksum 由后端 app_version.sha256 字段提供，
-          #    不随包分发 .sha256 文件，避免下载包里出现 exe 之外的杂项文件）
-          $hash = (Get-FileHash -Algorithm SHA256 $outExe).Hash.ToLower()
-          Write-Host "✅ SHA-256: $hash"
-
-          "version=$fileVersion" >> $env:GITHUB_OUTPUT
-          "version_code=$buildNumber" >> $env:GITHUB_OUTPUT
-          "exe_name=$exeName"     >> $env:GITHUB_OUTPUT
-          "exe_size=$exeSize"     >> $env:GITHUB_OUTPUT
-          "sha256=$hash"          >> $env:GITHUB_OUTPUT
-
-      - name: 📦 上传Artifact（备份 / 未配置开放接口时手工发布）
-        uses: actions/upload-artifact@v4
-        with:
-          name: enjoycards-prod-windows-portable
-          # 只上传本次版本的 exe，避免通配符把历史版本一并打包
-          path: ./source-code/enjoycards_app/build/windows/site/${{ steps.package.outputs.exe_name }}
-          if-no-files-found: error
-          retention-days: 90
-
-      # 通过开放接口（AK/SK 签名）完成「上传安装包 → 登记 app_version」，
-      # 官网 /v1/app/latest 与 /js/download.js 随即可见，替代原先「下载 Artifact + 手工上传 + 手工登记」。
-      # 必须在结算构建号之前执行：发布失败则计数器不落盘，下次构建会重试同一个版本号。
-      - name: 🌐 发布到官网（开放接口）
-        shell: bash
-        run: |
-          if [ -z "${OPEN_API_BASE_URL:-}" ] || [ -z "${OPEN_API_AK:-}" ] || [ -z "${OPEN_API_SK:-}" ]; then
-            echo "::notice::未配置 OPEN_API_BASE_URL/OPEN_API_AK/OPEN_API_SK，跳过自动发布（仍可用 Artifact 手工发布）"
-            exit 0
-          fi
-          bash "deploy/ios-android-build/scripts/publish-apk-open-api.sh" \
-            "source-code/enjoycards_app/build/windows/site/${{ steps.package.outputs.exe_name }}" \
-            "com.enjoycards.app.windows" \
-            "EnjoyCards" \
-            "${{ steps.ver.outputs.version_name }}" \
-            "${{ steps.package.outputs.version_code }}" \
-            "Windows 官网版 ${{ steps.ver.outputs.version_name }}"
-
-      # 便携版无商店交付渠道，交付物 = GitHub Artifact，故结算紧跟 artifact 上传（及官网发布）成功之后。
-      - name: 📌 结算构建版本号
-        shell: bash
-        run: |
-          set -e
-          BUILD_NUMBER="${{ steps.ver.outputs.build_number }}"
-          VERSION_TRACK_FILE=".github/deploy/version-enjoycards-windows-portable.txt"
-          echo "========================================"
-          echo "📌 结算构建版本号（产物已上传成功）"
-          echo "========================================"
-          echo "待写入计数器: $VERSION_TRACK_FILE = $BUILD_NUMBER"
-
-          COMMIT_MSG="chore: update EnjoyCards Windows portable build version tracking to $BUILD_NUMBER [skip ci]"
-          # 用 printf | base64 | tr 而非 base64 -w 0：BSD base64（macOS runner）不支持 -w
-          ENCODED_CONTENT=$(printf '%s' "$BUILD_NUMBER" | base64 | tr -d '\n')
-          API_URL="https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/${VERSION_TRACK_FILE}"
-
-          # 读当前 SHA：文件已存在时 PUT 必须带 sha，否则 GitHub 返回 409
-          FILE_SHA=""
-          HTTP_CODE=$(curl -s -o /tmp/api_response.json -w "%{http_code}" \
-            -H "Authorization: Bearer ${GH_PAT}" \
-            -H "Accept: application/vnd.github+json" \
-            "$API_URL")
-          if [ "$HTTP_CODE" = "200" ]; then
-            FILE_SHA=$(jq -r '.sha' /tmp/api_response.json)
-            echo "Existing file SHA: $FILE_SHA"
-          else
-            echo "ℹ️  计数器文件尚不存在（HTTP $HTTP_CODE），将新建"
-          fi
-
-          if [ -n "$FILE_SHA" ]; then
-            JSON_BODY=$(jq -n \
-              --arg msg "$COMMIT_MSG" \
-              --arg content "$ENCODED_CONTENT" \
-              --arg sha "$FILE_SHA" \
-              '{message: $msg, content: $content, sha: $sha}')
-          else
-            JSON_BODY=$(jq -n \
-              --arg msg "$COMMIT_MSG" \
-              --arg content "$ENCODED_CONTENT" \
-              '{message: $msg, content: $content}')
-          fi
-
-          # 重试 3 次：artifact 已生成，此处失败会让该编号下次被复用，必须尽力成功
-          SUCCESS=0
-          for attempt in 1 2 3; do
-            UPDATE_CODE=$(curl -s -o /tmp/update_response.json -w "%{http_code}" \
-              -X PUT \
-              -H "Authorization: Bearer ${GH_PAT}" \
-              -H "Accept: application/vnd.github+json" \
-              -H "Content-Type: application/json" \
-              -d "$JSON_BODY" \
-              "$API_URL")
-            if [ "$UPDATE_CODE" = "200" ] || [ "$UPDATE_CODE" = "201" ]; then
-              SUCCESS=1
-              break
-            fi
-            echo "⚠️  写入失败（第 $attempt 次，HTTP $UPDATE_CODE）"
-            cat /tmp/update_response.json || true
-            sleep $((attempt * 3))
-          done
-
-          if [ "$SUCCESS" != "1" ]; then
-            echo ""
-            echo "❌❌❌ 严重：产物已成功上传，但版本计数器写入失败！"
-            echo "    请立即手动把 $VERSION_TRACK_FILE 的内容改为 $BUILD_NUMBER，"
-            echo "    否则下次构建会复用该版本号。"
-            exit 1
-          fi
-
-          echo ""
-          echo "========================================"
-          echo "✅ Version Management Complete: ${{ steps.ver.outputs.version_name }}+$BUILD_NUMBER"
-          echo "========================================"
-        env:
-          GH_PAT: ${{ secrets.GH_PAT }}
-
-      - name: 📊 构建结果报告
-        id: report
-        shell: bash
-        run: |
-          echo "========================================"
-          echo "🎉 EnjoyCards Windows 便携版（Inno Setup 安装包）构建完成"
-          echo "========================================"
-          echo "状态: ✅ 成功"
-          echo "Runner: ${{ runner.os }}"
-          echo "Flutter: $(flutter --version | head -1)"
-          echo ""
-          echo "版本:      ${{ steps.package.outputs.version }}"
-          echo "文件名:    ${{ steps.package.outputs.exe_name }}"
-          echo "文件大小:  ${{ steps.package.outputs.exe_size }} 字节"
-          echo "SHA-256:   ${{ steps.package.outputs.sha256 }}"
-          echo ""
-          echo "Artifact: enjoycards-prod-windows-portable"
-          echo "========================================"
-          echo "取件方式（推荐用命令行，不经浏览器，不会触发 Chrome 下载拦截）："
-          echo "  gh run download ${{ github.run_id }} --repo ${{ github.repository }} -n enjoycards-prod-windows-portable -D ./dist"
-          echo "  （gh 会自动解压 artifact，./dist 下直接就是 EnjoyCards-Setup-<version>.exe）"
-          echo ""
-          echo "若已配置 OPEN_API_* Secrets，安装包已自动上传并发布到官网，无需手工操作；"
-          echo "若未配置（发布步骤被跳过），请手工执行："
-          echo "1. 上传 ./dist/EnjoyCards-Setup-<version>.exe 到官网发布服务器 / CDN"
-          echo "2. 在后端登记版本（package_name = com.enjoycards.app.windows），"
-          echo "   versionCode 必须填构建号 ${{ steps.package.outputs.version_code }}（即 ${{ steps.package.outputs.version }} 的末段），"
-          echo "   不能填 1.0.2 / 1002 之类的写法，否则客户端比对不出「有新版本」；"
-          echo "   同时填入上面的文件名、大小与 SHA-256"
-          echo "3. 打开 https://www.enjoycards.app/en/download/ 确认按钮变为可下载状态"
-          echo "========================================"
+name: EnjoyCards Windows Portable Build (官网下载 · Inno Setup 安装包)
+
+# 用途：构建 EnjoyCards Windows 桌面版，用 Inno Setup 打包成「带安装向导的安装包」，
+# 上传为 Artifact 并（配置 OPEN_API_* Secrets 后）通过开放接口自动上传 COS、
+# 在后端 app_version 表登记版本（package_name = com.enjoycards.app.windows），
+# 官网的 /js/download.js 据此展示版本、文件大小与 SHA-256 并即时可下载。
+# 未配置 Secrets 时自动发布步骤跳过，仍按原方式下载 Artifact 手工发布。
+#
+# 与 enjoycards-windows-build.yml 的分工：
+#   - 本文件          → 官网直接下载用的 Inno Setup 安装包（安装向导/快捷方式/卸载入口）
+#   - enjoycards-windows-build.yml → Microsoft Store 上架用的 MSIX
+# 两者共用同一份 Flutter 代码，但各自维护独立的版本 tracking 文件（互不干扰）。
+
+on:
+  workflow_dispatch:
+
+# 同一平台的构建必须串行：并发运行会先后读到同一个计数器值，产生重复的版本号。
+# 跨平台之间不再需要互斥 —— 各平台只读写自己的计数器文件。
+concurrency:
+  group: enjoycards-windows-portable-build
+  cancel-in-progress: false
+
+jobs:
+  build-windows-portable:
+    runs-on: windows-latest
+    name: 构建EnjoyCards Windows便携版（Inno Setup 安装包，供官网下载）
+    permissions:
+      contents: read
+    # 开放接口 AK/SK（GitHub Secrets 提供）；未配置时下方自动发布步骤会跳过
+    env:
+      OPEN_API_BASE_URL: ${{ secrets.OPEN_API_BASE_URL }}
+      OPEN_API_AK: ${{ secrets.OPEN_API_AK }}
+      OPEN_API_SK: ${{ secrets.OPEN_API_SK }}
+    steps:
+      - name: 📋 Checkout 当前打包仓库
+        uses: actions/checkout@v4
+
+      - name: 📥 拉取私有Gitee Flutter代码
+        shell: bash
+        run: |
+          git clone -b client-release https://oauth2:${{ secrets.GITEE_TOKEN }}@gitee.com/yunhaninfo/enjoy-chinese.git source-code
+          cd source-code
+
+      - name: 🔢 Manage Windows Portable Build Version
+        id: ver
+        working-directory: ./source-code
+        shell: bash
+        run: |
+          set -e
+          echo "========================================"
+          echo "🔢 Managing EnjoyCards Windows Portable Build Version"
+          echo "========================================"
+
+          # 版本名：只取 pubspec `version:` 中 `+` 之前的部分（跨平台统一，人工维护）。
+          # pubspec 的 `+N` 只是本地开发默认值，CI 既不读取也不回写 —— 构建号改由本平台
+          # 独立计数器维护，避免各平台互相推高版本号。
+          VERSION_NAME=$(grep "^version:" enjoycards_app/pubspec.yaml | sed 's/version: *//' | cut -d+ -f1 | tr -d ' ')
+          if [ -z "$VERSION_NAME" ]; then
+            echo "❌ 无法从 pubspec.yaml 解析版本名"
+            exit 1
+          fi
+          echo "Version name: $VERSION_NAME"
+
+          # 本平台构建号计数器（部署仓库内，只由本 workflow 读写）
+          VERSION_TRACK_FILE=".github/deploy/version-enjoycards-windows-portable.txt"
+          VERSION_FILE="$GITHUB_WORKSPACE/$VERSION_TRACK_FILE"
+          if [ -f "$VERSION_FILE" ]; then
+            STORED_BUILD=$(cat "$VERSION_FILE" | tr -d ' \n')
+          else
+            STORED_BUILD="0"
+            echo "ℹ️  Version tracking file not found, initializing to 0"
+          fi
+          echo "Stored build number: $STORED_BUILD"
+
+          # 内容非法时直接失败，不静默兜底：否则会把版本号重置
+          case "$STORED_BUILD" in
+            ''|*[!0-9]*)
+              echo "❌ 计数器文件内容非法: '$STORED_BUILD'（$VERSION_TRACK_FILE）"
+              exit 1
+              ;;
+          esac
+
+          # 独立自增：只看本平台的历史值，与其他平台无关
+          NEW_BUILD=$((STORED_BUILD + 1))
+          echo "⬆️  Auto-incrementing: $STORED_BUILD → $NEW_BUILD"
+
+          # 延迟写入：这里只计算 N 并透传，不落盘、不提交。
+          # 计数器由后续「📌 结算构建版本号」步骤在产物上传成功后才写入；
+          # 任何阶段失败都不会消耗版本号，因此也无需回滚。
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          echo "build_number=$NEW_BUILD"   >> "$GITHUB_OUTPUT"
+
+      - name: 🚀 配置 Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.2'
+          channel: stable
+
+      - name: 💾 缓存依赖
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/AppData/Local/Pub/Cache
+            ./source-code/enjoycards_app/.dart_tool
+            ./source-code/enjoycards_app/build/windows
+          key: ${{ runner.os }}-enjoycards-windows-portable-flutter-${{ hashFiles('source-code/enjoycards_app/pubspec.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-enjoycards-windows-portable-flutter-
+
+      - name: 📦 安装项目依赖
+        working-directory: ./source-code/enjoycards_app
+        run: flutter pub get
+
+      - name: 🏗️ 生成代码（json_serializable等）
+        working-directory: ./source-code/enjoycards_app
+        run: dart run build_runner build --delete-conflicting-outputs
+
+      - name: 🔨 编译 Windows Release
+        working-directory: ./source-code/enjoycards_app
+        shell: bash
+        run: |
+          echo "=== 开始构建 EnjoyCards Windows 桌面版 ==="
+          # 说明：不注入 REVENUECAT_API_KEY —— RevenueCat 在 Windows 上未启用
+          # （见 lib/services/revenuecat_service.dart: Platform.isIOS/MacOS/Android 之外直接 return）
+          #
+          # 本平台构建号由独立计数器维护（见 Manage Windows Portable Build Version）。
+          # 构建前把它写进 pubspec 的 `+N`，让 exe 内嵌版本与安装包版本、后端登记
+          # 的 versionCode 同源；否则客户端拿 1.0.2+44 去比后端的计数器值，会永远误判。
+          sed -i "s/^version:.*/version: ${{ steps.ver.outputs.version_name }}+${{ steps.ver.outputs.build_number }}/" pubspec.yaml
+          grep '^version:' pubspec.yaml
+          # DIST_CHANNEL=direct 打开应用内更新（仅官网直装包，MSIX/商店包保持关闭）
+          flutter build windows \
+            --release \
+            --dart-define=ENV=prod \
+            --dart-define=DIST_CHANNEL=direct \
+            --dart-define=PROD_API_HOST=${{ secrets.PROD_API_HOST }}
+          echo ""
+          echo "=== Windows 构建完成 ==="
+
+      - name: ✅ 校验产物（定位 Release 目录）
+        id: locate
+        working-directory: ./source-code/enjoycards_app
+        shell: pwsh
+        run: |
+          # Flutter 3.10+ 输出在 build/windows/x64/runner/Release；旧版在 build/windows/runner/Release。
+          # 这里按文件名反查，避免因 Flutter 版本差异导致路径写死而失败。
+          $exe = Get-ChildItem -Path 'build/windows' -Recurse -Filter 'enjoycards_app.exe' -File -ErrorAction SilentlyContinue |
+                 Where-Object { $_.DirectoryName -match 'Release' } |
+                 Select-Object -First 1
+          if (-not $exe) {
+            Write-Host "❌ 未找到 enjoycards_app.exe，build/windows 目录内容："
+            if (Test-Path 'build/windows') { Get-ChildItem -Path 'build/windows' -Recurse -Depth 3 | Select-Object FullName }
+            exit 1
+          }
+          $releaseDir = $exe.DirectoryName
+          Write-Host "✅ Release 目录: $releaseDir"
+          Write-Host "=== 目录内容（前 40 项）==="
+          Get-ChildItem -Path $releaseDir | Select-Object -First 40 Name, Length
+          Write-Host "=== 目录总大小 ==="
+          $sizeMb = [math]::Round(((Get-ChildItem $releaseDir -Recurse -File | Measure-Object Length -Sum).Sum / 1MB), 1)
+          Write-Host "$sizeMb MB"
+
+          # 关键文件必须在，否则用户下载后无法运行
+          foreach ($required in @('enjoycards_app.exe', 'flutter_windows.dll', 'data')) {
+            if (Test-Path (Join-Path $releaseDir $required)) {
+              Write-Host "✅ 包含 $required"
+            } else {
+              Write-Host "❌ 缺少 $required —— 打包后会无法运行"
+              exit 1
+            }
+          }
+
+          "release_dir=$releaseDir" >> $env:GITHUB_OUTPUT
+
+      - name: 📦 打包为安装包（Inno Setup）
+        id: package
+        working-directory: ./source-code/enjoycards_app
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $releaseDir = '${{ steps.locate.outputs.release_dir }}'
+          # 版本号来自本平台独立计数器（见 Manage Windows Portable Build Version 步骤），
+          # 不再从 pubspec.yaml 拼接 —— 否则各平台会互相推高版本号。
+          $versionName = '${{ steps.ver.outputs.version_name }}'
+          $buildNumber = '${{ steps.ver.outputs.build_number }}'
+          $fileVersion = "$versionName.$buildNumber"
+          Write-Host "打包版本: $fileVersion"
+
+          $outDir = Join-Path (Get-Location) 'build/windows/site'
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+          # build/windows 会被 actions/cache 还原，上一版的安装包与校验文件会被一起带回；
+          # 不清理会导致上传的 artifact 混入多个版本的 exe，官网登记校验值将对不上。
+          Remove-Item -Path (Join-Path $outDir 'EnjoyCards-Setup-*.exe*') -Force -ErrorAction SilentlyContinue
+          $exeName = "EnjoyCards-Setup-$fileVersion.exe"
+          $outExe  = Join-Path $outDir $exeName
+          $issPath = Join-Path $outDir 'enjoycards.iss'
+
+          # 1) 定位 Inno Setup 编译器（runner 镜像预装；先查 PATH 再查默认安装目录，最后 choco 兜底）
+          $iscc = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) {
+            foreach ($p in @(
+              "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
+              "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+              "$env:ProgramFiles\Inno Setup 5\ISCC.exe",
+              "${env:ProgramFiles(x86)}\Inno Setup 5\ISCC.exe"
+            )) {
+              if (Test-Path $p) { $iscc = $p; break }
+            }
+          }
+          if (-not $iscc -and (Test-Path 'C:\ProgramData\chocolatey\lib')) {
+            $iscc = Get-ChildItem 'C:\ProgramData\chocolatey\lib' -Recurse -Filter 'ISCC.exe' -File -ErrorAction SilentlyContinue |
+                    Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $iscc) { throw '未找到 ISCC.exe（Inno Setup 编译器），无法生成安装包' }
+          Write-Host "ISCC: $iscc"
+
+          # 2) 生成 Inno Setup 脚本（安装向导 / 目录选择 / 快捷方式 / 卸载入口 / 装完可自动运行）
+          #    脚本在 CI 内动态生成、不落地到 Flutter 仓库；内容保持纯 ASCII，避免编码问题。
+          $iconPath = Join-Path (Get-Location) 'windows/runner/resources/app_icon.ico'
+          $iconLine = if (Test-Path $iconPath) { "SetupIconFile=$iconPath" } else { '' }
+          $islPath  = Join-Path (Split-Path $iscc) 'Languages\ChineseSimplified.isl'
+          $cnLine   = if (Test-Path $islPath) { 'Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"' } else { '' }
+          $outputBase = $exeName -replace '\.exe$', ''
+
+          $issLines = @(
+            '; generated by CI - do not edit by hand'
+            '[Setup]'
+            'AppId={{8F1D2A54-3C6B-4E7A-9D21-5B0C7E3A1F42}'
+            'AppName=EnjoyCards'
+            "AppVersion=$fileVersion"
+            'AppPublisher=EnjoyCards'
+            'DefaultDirName={autopf}\EnjoyCards'
+            'DefaultGroupName=EnjoyCards'
+            'DisableProgramGroupPage=yes'
+            'AllowNoIcons=yes'
+            'PrivilegesRequired=lowest'
+            'ArchitecturesInstallIn64BitMode=x64'
+            'Compression=lzma2/max'
+            'SolidCompression=yes'
+            'WizardStyle=modern'
+            # 应用内静默更新由客户端拉起安装包：安装前自动关闭仍在运行的 EnjoyCards，
+            # 避免 exe 被占用导致覆盖失败。
+            'CloseApplications=yes'
+            'RestartApplications=no'
+            'UninstallDisplayName=EnjoyCards'
+            'UninstallDisplayIcon={app}\enjoycards_app.exe'
+            "OutputDir=$outDir"
+            "OutputBaseFilename=$outputBase"
+          )
+          if ($iconLine) { $issLines += $iconLine }
+          $issLines += @(
+            ''
+            '[Languages]'
+            'Name: "english"; MessagesFile: "compiler:Default.isl"'
+          )
+          if ($cnLine) { $issLines += $cnLine }
+          $issLines += @(
+            ''
+            '[Tasks]'
+            'Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: checkedonce'
+            ''
+            '[Files]'
+            "Source: `"$releaseDir\*`"; DestDir: `"{app}`"; Flags: ignoreversion recursesubdirs createallsubdirs"
+            ''
+            '[Icons]'
+            'Name: "{autoprograms}\EnjoyCards"; Filename: "{app}\enjoycards_app.exe"'
+            'Name: "{autodesktop}\EnjoyCards"; Filename: "{app}\enjoycards_app.exe"; Tasks: desktopicon'
+            ''
+            '[Run]'
+            'Filename: "{app}\enjoycards_app.exe"; Description: "{cm:LaunchProgram,EnjoyCards}"; Flags: nowait postinstall skipifsilent'
+            # 应用内静默更新：安装完成后自动拉起应用（仅在 /SILENT 模式下生效）
+            'Filename: "{app}\enjoycards_app.exe"; Flags: nowait; Check: IsSilentMode'
+            ''
+            '[Code]'
+            'function IsSilentMode: Boolean;'
+            'begin'
+            '  Result := WizardSilent;'
+            'end;'
+          )
+          [System.IO.File]::WriteAllLines($issPath, $issLines, (New-Object System.Text.UTF8Encoding($true)))
+          Write-Host "Inno Setup 脚本: $issPath"
+
+          # 3) 剔除调试符号，减小体积
+          Get-ChildItem -Path $releaseDir -Recurse -Include '*.pdb' -File | Remove-Item -Force -ErrorAction SilentlyContinue
+
+          # 4) 编译安装包（ISCC 按脚本把 Release 目录整体打进安装包）
+          & $iscc $issPath
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup 编译失败，退出码 $LASTEXITCODE" }
+          if (-not (Test-Path $outExe)) { throw "未生成安装包: $outExe" }
+
+          $exeSize = (Get-Item $outExe).Length
+          Write-Host "✅ 已生成安装包: $outExe ($([math]::Round($exeSize / 1MB, 1)) MB)"
+
+          # 5) 计算 SHA-256（官网展示的 checksum 由后端 app_version.sha256 字段提供，
+          #    不随包分发 .sha256 文件，避免下载包里出现 exe 之外的杂项文件）
+          $hash = (Get-FileHash -Algorithm SHA256 $outExe).Hash.ToLower()
+          Write-Host "✅ SHA-256: $hash"
+
+          "version=$fileVersion" >> $env:GITHUB_OUTPUT
+          "version_code=$buildNumber" >> $env:GITHUB_OUTPUT
+          "exe_name=$exeName"     >> $env:GITHUB_OUTPUT
+          "exe_size=$exeSize"     >> $env:GITHUB_OUTPUT
+          "sha256=$hash"          >> $env:GITHUB_OUTPUT
+
+      - name: 📦 上传Artifact（备份 / 未配置开放接口时手工发布）
+        uses: actions/upload-artifact@v4
+        with:
+          name: enjoycards-prod-windows-portable
+          # 只上传本次版本的 exe，避免通配符把历史版本一并打包
+          path: ./source-code/enjoycards_app/build/windows/site/${{ steps.package.outputs.exe_name }}
+          if-no-files-found: error
+          retention-days: 90
+
+      # 通过开放接口（AK/SK 签名）完成「上传安装包 → 登记 app_version」，
+      # 官网 /v1/app/latest 与 /js/download.js 随即可见，替代原先「下载 Artifact + 手工上传 + 手工登记」。
+      # 必须在结算构建号之前执行：发布失败则计数器不落盘，下次构建会重试同一个版本号。
+      - name: 🌐 发布到官网（开放接口）
+        shell: bash
+        run: |
+          if [ -z "${OPEN_API_BASE_URL:-}" ] || [ -z "${OPEN_API_AK:-}" ] || [ -z "${OPEN_API_SK:-}" ]; then
+            echo "::notice::未配置 OPEN_API_BASE_URL/OPEN_API_AK/OPEN_API_SK，跳过自动发布（仍可用 Artifact 手工发布）"
+            exit 0
+          fi
+          bash "deploy/ios-android-build/scripts/publish-apk-open-api.sh" \
+            "source-code/enjoycards_app/build/windows/site/${{ steps.package.outputs.exe_name }}" \
+            "com.enjoycards.app.windows" \
+            "EnjoyCards" \
+            "${{ steps.ver.outputs.version_name }}" \
+            "${{ steps.package.outputs.version_code }}" \
+            "Windows 官网版 ${{ steps.ver.outputs.version_name }}"
+
+      # 便携版无商店交付渠道，交付物 = GitHub Artifact，故结算紧跟 artifact 上传（及官网发布）成功之后。
+      - name: 📌 结算构建版本号
+        shell: bash
+        run: |
+          set -e
+          BUILD_NUMBER="${{ steps.ver.outputs.build_number }}"
+          VERSION_TRACK_FILE=".github/deploy/version-enjoycards-windows-portable.txt"
+          echo "========================================"
+          echo "📌 结算构建版本号（产物已上传成功）"
+          echo "========================================"
+          echo "待写入计数器: $VERSION_TRACK_FILE = $BUILD_NUMBER"
+
+          COMMIT_MSG="chore: update EnjoyCards Windows portable build version tracking to $BUILD_NUMBER [skip ci]"
+          # 用 printf | base64 | tr 而非 base64 -w 0：BSD base64（macOS runner）不支持 -w
+          ENCODED_CONTENT=$(printf '%s' "$BUILD_NUMBER" | base64 | tr -d '\n')
+          API_URL="https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/${VERSION_TRACK_FILE}"
+
+          # 读当前 SHA：文件已存在时 PUT 必须带 sha，否则 GitHub 返回 409
+          FILE_SHA=""
+          HTTP_CODE=$(curl -s -o /tmp/api_response.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${GH_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            "$API_URL")
+          if [ "$HTTP_CODE" = "200" ]; then
+            FILE_SHA=$(jq -r '.sha' /tmp/api_response.json)
+            echo "Existing file SHA: $FILE_SHA"
+          else
+            echo "ℹ️  计数器文件尚不存在（HTTP $HTTP_CODE），将新建"
+          fi
+
+          if [ -n "$FILE_SHA" ]; then
+            JSON_BODY=$(jq -n \
+              --arg msg "$COMMIT_MSG" \
+              --arg content "$ENCODED_CONTENT" \
+              --arg sha "$FILE_SHA" \
+              '{message: $msg, content: $content, sha: $sha}')
+          else
+            JSON_BODY=$(jq -n \
+              --arg msg "$COMMIT_MSG" \
+              --arg content "$ENCODED_CONTENT" \
+              '{message: $msg, content: $content}')
+          fi
+
+          # 重试 3 次：artifact 已生成，此处失败会让该编号下次被复用，必须尽力成功
+          SUCCESS=0
+          for attempt in 1 2 3; do
+            UPDATE_CODE=$(curl -s -o /tmp/update_response.json -w "%{http_code}" \
+              -X PUT \
+              -H "Authorization: Bearer ${GH_PAT}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Content-Type: application/json" \
+              -d "$JSON_BODY" \
+              "$API_URL")
+            if [ "$UPDATE_CODE" = "200" ] || [ "$UPDATE_CODE" = "201" ]; then
+              SUCCESS=1
+              break
+            fi
+            echo "⚠️  写入失败（第 $attempt 次，HTTP $UPDATE_CODE）"
+            cat /tmp/update_response.json || true
+            sleep $((attempt * 3))
+          done
+
+          if [ "$SUCCESS" != "1" ]; then
+            echo ""
+            echo "❌❌❌ 严重：产物已成功上传，但版本计数器写入失败！"
+            echo "    请立即手动把 $VERSION_TRACK_FILE 的内容改为 $BUILD_NUMBER，"
+            echo "    否则下次构建会复用该版本号。"
+            exit 1
+          fi
+
+          echo ""
+          echo "========================================"
+          echo "✅ Version Management Complete: ${{ steps.ver.outputs.version_name }}+$BUILD_NUMBER"
+          echo "========================================"
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+
+      - name: 📊 构建结果报告
+        id: report
+        shell: bash
+        run: |
+          echo "========================================"
+          echo "🎉 EnjoyCards Windows 便携版（Inno Setup 安装包）构建完成"
+          echo "========================================"
+          echo "状态: ✅ 成功"
+          echo "Runner: ${{ runner.os }}"
+          echo "Flutter: $(flutter --version | head -1)"
+          echo ""
+          echo "版本:      ${{ steps.package.outputs.version }}"
+          echo "文件名:    ${{ steps.package.outputs.exe_name }}"
+          echo "文件大小:  ${{ steps.package.outputs.exe_size }} 字节"
+          echo "SHA-256:   ${{ steps.package.outputs.sha256 }}"
+          echo ""
+          echo "Artifact: enjoycards-prod-windows-portable"
+          echo "========================================"
+          echo "取件方式（推荐用命令行，不经浏览器，不会触发 Chrome 下载拦截）："
+          echo "  gh run download ${{ github.run_id }} --repo ${{ github.repository }} -n enjoycards-prod-windows-portable -D ./dist"
+          echo "  （gh 会自动解压 artifact，./dist 下直接就是 EnjoyCards-Setup-<version>.exe）"
+          echo ""
+          echo "若已配置 OPEN_API_* Secrets，安装包已自动上传并发布到官网，无需手工操作；"
+          echo "若未配置（发布步骤被跳过），请手工执行："
+          echo "1. 上传 ./dist/EnjoyCards-Setup-<version>.exe 到官网发布服务器 / CDN"
+          echo "2. 在后端登记版本（package_name = com.enjoycards.app.windows），"
+          echo "   versionCode 必须填构建号 ${{ steps.package.outputs.version_code }}（即 ${{ steps.package.outputs.version }} 的末段），"
+          echo "   不能填 1.0.2 / 1002 之类的写法，否则客户端比对不出「有新版本」；"
+          echo "   同时填入上面的文件名、大小与 SHA-256"
+          echo "3. 打开 https://www.enjoycards.app/en/download/ 确认按钮变为可下载状态"
+          echo "========================================"
 
   # ============================================================
   # 企业微信通知：成功 / 失败都推送，与其他构建 workflow 保持一致。
