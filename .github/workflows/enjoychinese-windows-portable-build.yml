@@ -36,6 +36,9 @@ jobs:
       OPEN_API_BASE_URL: ${{ secrets.OPEN_API_BASE_URL }}
       OPEN_API_AK: ${{ secrets.OPEN_API_AK }}
       OPEN_API_SK: ${{ secrets.OPEN_API_SK }}
+      # CMake 4.x 专用开关：把 cmake_minimum_required(VERSION < 3.5) 的策略下限抬到 3.5。
+      # Firebase C++ SDK 仍写旧版本号，靠这个环境变量让它能配置通过（3.31 会忽略该变量）。
+      CMAKE_POLICY_VERSION_MINIMUM: '3.5'
     steps:
       - name: 📋 Checkout 当前打包仓库
         uses: actions/checkout@v4
@@ -155,11 +158,43 @@ jobs:
           # 的 versionCode 同源；否则客户端拿旧版本号去比后端的计数器值，会永远误判。
           sed -i "s/^version:.*/version: ${{ steps.ver.outputs.version_name }}+${{ steps.ver.outputs.build_number }}/" pubspec.yaml
           grep '^version:' pubspec.yaml
-          flutter build windows \
-            --release \
-            --dart-define=ENV=prod \
-            --dart-define=PROD_API_HOST=${{ secrets.PROD_API_HOST }}
-          echo ""
+
+          build() {
+            flutter build windows \
+              --release \
+              --dart-define=ENV=prod \
+              --dart-define=PROD_API_HOST=${{ secrets.PROD_API_HOST }}
+          }
+
+          if build; then
+            echo "=== Windows 构建完成 ==="
+            exit 0
+          fi
+
+          # 兜底：Firebase C++ SDK 是在配置阶段下载到 build/windows/x64/extracted 的，
+          # 若镜像里的 CMake 4.x 仍不接受它的旧版本号（环境变量在该调用路径未生效），
+          # 直接把 SDK 内所有 CMakeLists 的 cmake_minimum_required 抬到 3.5 后重建一次。
+          SDK_DIR="build/windows/x64/extracted/firebase_cpp_sdk_windows"
+          echo "⚠️ 首次构建失败，检查 Firebase C++ SDK 的 CMake 最低版本"
+          if [ ! -d "$SDK_DIR" ]; then
+            echo "❌ 未找到 $SDK_DIR，失败原因不是该问题，终止"
+            exit 1
+          fi
+
+          PATCHED=0
+          while IFS= read -r f; do
+            sed -i -E 's/cmake_minimum_required\(VERSION (2\.[0-9]+|3\.[0-4])[^)]*\)/cmake_minimum_required(VERSION 3.5)/' "$f"
+            echo "🩹 $f → $(grep -m1 'cmake_minimum_required' "$f")"
+            PATCHED=1
+          done < <(grep -rlE 'cmake_minimum_required\(VERSION (2\.|3\.[0-4])' "$SDK_DIR" --include=CMakeLists.txt || true)
+
+          if [ "$PATCHED" = "0" ]; then
+            echo "❌ 未找到需要修补的 CMakeLists，失败原因不是该问题，终止"
+            exit 1
+          fi
+
+          echo "=== 修补后重新构建 ==="
+          build
           echo "=== Windows 构建完成 ==="
 
       - name: ✅ 校验产物（定位 Release 目录）
