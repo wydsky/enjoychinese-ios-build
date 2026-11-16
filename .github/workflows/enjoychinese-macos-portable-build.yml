@@ -104,7 +104,7 @@ jobs:
           # 内容非法时直接失败，不静默兜底：否则会把版本号重置
           case "$STORED_BUILD" in
             ''|*[!0-9]*)
-              echo "❌ 计数器文件内容非法: '$STORED_BUILD'（$VERSION_TRACK_FILE）"
+              echo "❌ 计数器文件内容非法: '$STORED_BUILD'（${VERSION_TRACK_FILE}）"
               exit 1
               ;;
           esac
@@ -301,9 +301,9 @@ jobs:
           [ "$BUNDLE_ID" = "com.enjoychinese.app" ] || { echo "❌ Bundle ID 期望 com.enjoychinese.app"; exit 1; }
           # 断言产物真的带上了本平台计数器号，兜住 "--build-number 被忽略/被工程配置覆盖" 这类静默失效
           [ "$BUILD_VERSION" = "${{ steps.ver.outputs.build_number }}" ] || {
-            echo "❌ CFBundleVersion=$BUILD_VERSION，期望 ${{ steps.ver.outputs.build_number }}"; exit 1; }
+            echo "❌ CFBundleVersion=${BUILD_VERSION}，期望 ${{ steps.ver.outputs.build_number }}"; exit 1; }
           [ "$SHORT_VERSION" = "${{ steps.ver.outputs.version_name }}" ] || {
-            echo "❌ CFBundleShortVersionString=$SHORT_VERSION，期望 ${{ steps.ver.outputs.version_name }}"; exit 1; }
+            echo "❌ CFBundleShortVersionString=${SHORT_VERSION}，期望 ${{ steps.ver.outputs.version_name }}"; exit 1; }
 
           echo ""
           echo "=== 签名信息 ==="
@@ -375,24 +375,34 @@ jobs:
           APP_PATH="${{ steps.verify.outputs.app_path }}"
 
           echo "=== 提交公证（notarytool，异步返回后等待结果） ==="
+          SUBMIT_EXIT=0
           xcrun notarytool submit "$DMG_PATH" \
             --apple-id "$APPLE_ID" \
             --team-id "$TEAM" \
             --password "$APP_STORE_CONNECT_PASSWORD" \
             --wait \
-            --output-format json > /tmp/notary_result.json
+            --output-format json > /tmp/notary_result.json || SUBMIT_EXIT=$?
 
-          cat /tmp/notary_result.json
-          NOTARY_STATUS=$(jq -r '.status // "Unknown"' /tmp/notary_result.json)
-          NOTARY_ID=$(jq -r '.id // ""' /tmp/notary_result.json)
-          echo "公证 ID: $NOTARY_ID，状态: $NOTARY_STATUS"
+          cat /tmp/notary_result.json || true
+          NOTARY_STATUS=$(jq -r '.status // "Unknown"' /tmp/notary_result.json 2>/dev/null || echo "Unknown")
+          NOTARY_ID=$(jq -r '.id // ""' /tmp/notary_result.json 2>/dev/null || echo "")
+          echo "公证 ID: ${NOTARY_ID} 状态: ${NOTARY_STATUS}（submit 退出码 ${SUBMIT_EXIT}）"
 
           if [ "$NOTARY_STATUS" != "Accepted" ]; then
-            echo "❌ 公证未通过，输出日志："
-            xcrun notarytool log "$NOTARY_ID" \
-              --apple-id "$APPLE_ID" \
-              --team-id "$TEAM" \
-              --password "$APP_STORE_CONNECT_PASSWORD" || true
+            echo "❌ 公证未通过，拉取 Apple 详细日志："
+            if [ -n "$NOTARY_ID" ]; then
+              xcrun notarytool log "$NOTARY_ID" \
+                --apple-id "$APPLE_ID" \
+                --team-id "$TEAM" \
+                --password "$APP_STORE_CONNECT_PASSWORD" \
+                --output-format json > /tmp/notary_log.json || true
+              cat /tmp/notary_log.json || true
+              echo ""
+              echo "=== 关键问题（severity / path / message） ==="
+              jq -r '.issues[]? | "\(.severity)\t\(.path // "-")\t\(.message)"' /tmp/notary_log.json 2>/dev/null || true
+            else
+              echo "⚠️  未取得公证 ID，无法拉取日志"
+            fi
             exit 1
           fi
 
@@ -484,7 +494,7 @@ jobs:
             FILE_SHA=$(jq -r '.sha' /tmp/api_response.json)
             echo "Existing file SHA: $FILE_SHA"
           else
-            echo "ℹ️  计数器文件尚不存在（HTTP $HTTP_CODE），将新建"
+            echo "ℹ️  计数器文件尚不存在（HTTP ${HTTP_CODE}），将新建"
           fi
 
           if [ -n "$FILE_SHA" ]; then
@@ -514,7 +524,7 @@ jobs:
               SUCCESS=1
               break
             fi
-            echo "⚠️  写入失败（第 $attempt 次，HTTP $UPDATE_CODE）"
+            echo "⚠️  写入失败（第 ${attempt} 次，HTTP ${UPDATE_CODE}）"
             cat /tmp/update_response.json || true
             sleep $((attempt * 3))
           done
@@ -522,7 +532,7 @@ jobs:
           if [ "$SUCCESS" != "1" ]; then
             echo ""
             echo "❌❌❌ 严重：产物已成功上传，但版本计数器写入失败！"
-            echo "    请立即手动把 $VERSION_TRACK_FILE 的内容改为 $BUILD_NUMBER，"
+            echo "    请立即手动把 $VERSION_TRACK_FILE 的内容改为 ${BUILD_NUMBER}，"
             echo "    否则下次构建会复用该版本号。"
             exit 1
           fi
