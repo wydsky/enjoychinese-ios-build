@@ -233,8 +233,15 @@ jobs:
           PBX=macos/Runner.xcodeproj/project.pbxproj
           sed -i '' -e "s|CODE_SIGN_IDENTITY = \"-\";|CODE_SIGN_IDENTITY = \"$CERT_IDENTITY\";|g" "$PBX"
           sed -i '' -e 's|CODE_SIGN_STYLE = Automatic;|CODE_SIGN_STYLE = Manual;|g' "$PBX"
+          # 禁止 Xcode 注入「基础 entitlements」：它会往主可执行文件塞
+          # com.apple.security.get-task-allow（调试用），公证会直接判 Invalid。
+          if grep -q 'CODE_SIGN_INJECT_BASE_ENTITLEMENTS' "$PBX"; then
+            sed -i '' -E 's|CODE_SIGN_INJECT_BASE_ENTITLEMENTS = [^;]*;|CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO;|g' "$PBX"
+          else
+            perl -i -pe 's/^(\s*)CODE_SIGN_STYLE = Manual;$/$1CODE_SIGN_STYLE = Manual;\n$1CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO;/' "$PBX"
+          fi
           echo "=== pbxproj 中的签名配置 ==="
-          grep -nE 'CODE_SIGN_IDENTITY|CODE_SIGN_STYLE|DEVELOPMENT_TEAM|PROVISIONING_PROFILE_SPECIFIER' "$PBX"
+          grep -nE 'CODE_SIGN_IDENTITY|CODE_SIGN_STYLE|CODE_SIGN_INJECT_BASE_ENTITLEMENTS|DEVELOPMENT_TEAM|PROVISIONING_PROFILE_SPECIFIER' "$PBX"
           if grep -q 'CODE_SIGN_IDENTITY = "-";' "$PBX"; then
             echo "❌ pbxproj 仍存在 ad-hoc 签名配置，替换失败"
             exit 1
@@ -326,6 +333,23 @@ jobs:
             fi
             codesign --verify --deep --strict "$APP_PATH"
             codesign -dv --verbose=4 "$APP_PATH" 2>&1 | grep -E "Authority|flags" | head -5
+          fi
+          # 公证硬性要求：主可执行文件不得带 get-task-allow（调试权限），
+          # 否则 notarytool 直接判 Invalid（code 4000, "requests the com.apple.security.get-task-allow entitlement"）
+          if codesign -d --entitlements :- "$APP_PATH" 2>/dev/null | grep -q "get-task-allow"; then
+            echo "⚠️  检测到 com.apple.security.get-task-allow，剔除后重签"
+            codesign -d --entitlements :- "$APP_PATH" > /tmp/app_entitlements.plist 2>/dev/null || true
+            /usr/libexec/PlistBuddy -c "Delete :com.apple.security.get-task-allow" /tmp/app_entitlements.plist 2>/dev/null || true
+            codesign --force --options runtime --timestamp \
+              --entitlements /tmp/app_entitlements.plist \
+              --sign "$CERT_IDENTITY" "$APP_PATH"
+            codesign --verify --deep --strict "$APP_PATH"
+            if codesign -d --entitlements :- "$APP_PATH" 2>/dev/null | grep -q "get-task-allow"; then
+              echo "❌ get-task-allow 仍存在，公证必定失败"
+              exit 1
+            fi
+          else
+            echo "✅ entitlements 未包含 get-task-allow"
           fi
           echo "✅ 签名校验通过"
 
