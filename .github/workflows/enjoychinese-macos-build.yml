@@ -223,15 +223,44 @@ jobs:
           echo "=== AppInfo.xcconfig Bundle ID ==="
           grep PRODUCT_BUNDLE_IDENTIFIER macos/Runner/Configs/AppInfo.xcconfig
 
-          # 2) Release 构建配置写入 MAS 签名设置（写进 Release.xcconfig，构建时生效）
-          XC=macos/Runner/Configs/Release.xcconfig
-          ensure() { grep -qF "$1" "$XC" || echo "$1" >> "$XC"; }
-          ensure "CODE_SIGN_STYLE = Manual"
-          ensure "DEVELOPMENT_TEAM = JU3D9VJFCN"
-          ensure "CODE_SIGN_IDENTITY = \"Apple Distribution\""
-          ensure "PROVISIONING_PROFILE_SPECIFIER = $PROV_NAME"
-          echo "=== Release.xcconfig 签名配置 ==="
-          cat "$XC"
+          # 2) 直接改写 Xcode 工程（project.pbxproj），而不是只写 Release.xcconfig：
+          #    Runner target 的 Release 配置以 AppInfo.xcconfig 为 base，且显式写死了
+          #    PROVISIONING_PROFILE_SPECIFIER = ""；项目级配置又写死 CODE_SIGN_IDENTITY = "-"。
+          #    pbxproj 中 buildSettings 的优先级高于 xcconfig，只改 xcconfig 不会生效 ——
+          #    这正是首次上传报 90296（无沙箱 entitlements）与 90889（无内嵌 profile）的根因。
+          PBX=macos/Runner.xcodeproj/project.pbxproj
+          # ad-hoc 身份 → Apple Distribution
+          perl -i -pe 's/CODE_SIGN_IDENTITY = "-";/CODE_SIGN_IDENTITY = "Apple Distribution";/g' "$PBX"
+          # 空的 profile specifier → 真实 profile 名（Xcode 按名字在 ~/Library/MobileDevice 中查找）
+          perl -i -pe 's/PROVISIONING_PROFILE_SPECIFIER = "";/PROVISIONING_PROFILE_SPECIFIER = "'"$PROV_NAME"'";/g' "$PBX"
+          # Automatic → Manual：否则 Xcode 会尝试自动匹配 profile 并覆盖上面的显式设置
+          perl -i -pe 's/CODE_SIGN_STYLE = Automatic;/CODE_SIGN_STYLE = Manual;/g' "$PBX"
+          # 缺 DEVELOPMENT_TEAM 时补上
+          if ! grep -q 'DEVELOPMENT_TEAM' "$PBX"; then
+            perl -i -pe 's/^(\s*)CODE_SIGN_STYLE = Manual;/$1CODE_SIGN_STYLE = Manual;\n$1DEVELOPMENT_TEAM = JU3D9VJFCN;/' "$PBX"
+          fi
+
+          echo "=== pbxproj 中的签名配置 ==="
+          grep -nE 'CODE_SIGN_IDENTITY|CODE_SIGN_STYLE|DEVELOPMENT_TEAM|PROVISIONING_PROFILE_SPECIFIER' "$PBX"
+
+          # 断言替换真的命中：否则会静默拿 ad-hoc 身份构建，直到上传阶段才暴露，白跑一整轮
+          if grep -q 'CODE_SIGN_IDENTITY = "-";' "$PBX"; then
+            echo "❌ pbxproj 仍存在 ad-hoc 签名配置，替换失败"
+            exit 1
+          fi
+          if ! grep -q "PROVISIONING_PROFILE_SPECIFIER = \"$PROV_NAME\";" "$PBX"; then
+            echo "❌ PROVISIONING_PROFILE_SPECIFIER 未写入 pbxproj"
+            exit 1
+          fi
+
+          # 3) Info.plist 补 LSApplicationCategoryType（缺失会被 ASC 以 90242 拒收）。
+          #    必须在签名前修改：签名后再改 Info.plist 会让签名失效。
+          PLIST=macos/Runner/Info.plist
+          if ! /usr/libexec/PlistBuddy -c "Print :LSApplicationCategoryType" "$PLIST" >/dev/null 2>&1; then
+            /usr/libexec/PlistBuddy -c "Add :LSApplicationCategoryType string public.app-category.education" "$PLIST"
+          fi
+          echo "=== LSApplicationCategoryType ==="
+          /usr/libexec/PlistBuddy -c "Print :LSApplicationCategoryType" "$PLIST"
 
       - name: 🧩 确保 App Sandbox 联网权限（Mac App Store 必需）
         # App Sandbox 不是开发者后台 App ID 的 Capability 开关，而是工程里的 entitlements。
@@ -319,6 +348,19 @@ jobs:
           echo "=== 签名验证 ==="
           codesign --verify --deep --strict "$APP_PATH" && echo "✅ 代码签名验证通过"
           codesign -dv --verbose=4 "$APP_PATH" 2>&1 | grep -E "Identifier|TeamIdentifier|flags|Authority" | head
+
+          # 必须是真实分发身份：ad-hoc("-")签名不会内嵌 profile，ASC 会直接拒收
+          if ! codesign -dv --verbose=4 "$APP_PATH" 2>&1 | grep -q "Authority=Apple Distribution"; then
+            echo "❌ 签名主体不是 Apple Distribution（ad-hoc？），检查 pbxproj 补丁是否生效"
+            exit 1
+          fi
+          # Mac App Store 版必须内嵌分发 profile，否则 ASC 报 90889、TestFlight 不可用
+          if [ ! -f "$APP_PATH/Contents/embedded.provisionprofile" ]; then
+            echo "❌ 缺少 Contents/embedded.provisionprofile"
+            ls -la "$APP_PATH/Contents" || true
+            exit 1
+          fi
+          echo "✅ 已内嵌 provisioning profile"
           echo ""
           echo "=== Entitlements（沙箱+联网，App Store 必需） ==="
           codesign -d --entitlements - --xml "$APP_PATH" 2>/dev/null > /tmp/macos_entitlements.plist || true

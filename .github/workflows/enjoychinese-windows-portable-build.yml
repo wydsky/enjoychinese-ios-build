@@ -100,6 +100,24 @@ jobs:
           flutter-version: '3.44.2'
           channel: stable
 
+      - name: 🛠️ 固定 CMake 3.31.6（规避 Firebase C++ SDK 的 cmake_minimum_required < 3.5）
+        # windows-latest 预装的 CMake 已升到 4.x，4.0 起移除了对 cmake_minimum_required(VERSION < 3.5)
+        # 的兼容；firebase_core 在 Windows 构建时下载的 firebase_cpp_sdk_windows 仍写着旧版本号，
+        # 于是直接报 "Compatibility with CMake < 3.5 has been removed from CMake"。
+        # 上游插件修好前，构建机固定用 3.31.x（Firebase SDK 与 Flutter 均兼容）。
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = '3.31.6'
+          $zip = Join-Path $env:RUNNER_TEMP 'cmake.zip'
+          $dir = Join-Path $env:RUNNER_TEMP 'cmake-pinned'
+          Invoke-WebRequest -Uri "https://github.com/Kitware/CMake/releases/download/v$version/cmake-$version-windows-x86_64.zip" -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+          $bin = Join-Path $dir "cmake-$version-windows-x86_64\bin"
+          # 写入 GITHUB_PATH 的目录在后续步骤中排到 PATH 最前面，优先于预装版本
+          $bin | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          & (Join-Path $bin 'cmake.exe') --version
+
       - name: 💾 缓存依赖
         uses: actions/cache@v4
         with:
@@ -107,9 +125,11 @@ jobs:
             ~/AppData/Local/Pub/Cache
             ./source-code/enjoychinese_app/.dart_tool
             ./source-code/enjoychinese_app/build/windows
-          key: ${{ runner.os }}-enjoychinese-windows-portable-flutter-${{ hashFiles('source-code/enjoychinese_app/pubspec.lock') }}
+          # key 里带 cmake331：上一轮用 CMake 4 配置失败时生成的 build/windows 缓存
+          # （含 CMakeCache.txt）不能复用，换个键让它重新生成
+          key: ${{ runner.os }}-enjoychinese-windows-portable-flutter-cmake331-${{ hashFiles('source-code/enjoychinese_app/pubspec.lock') }}
           restore-keys: |
-            ${{ runner.os }}-enjoychinese-windows-portable-flutter-
+            ${{ runner.os }}-enjoychinese-windows-portable-flutter-cmake331-
 
       - name: 📦 安装项目依赖
         working-directory: ./source-code/enjoychinese_app
