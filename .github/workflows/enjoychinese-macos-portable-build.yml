@@ -225,6 +225,32 @@ jobs:
           echo "=== Release.xcconfig ==="
           cat "$XC"
 
+          # 3) 直接改写 Xcode 工程（project.pbxproj）：
+          #    项目级 buildSettings 里写死了 CODE_SIGN_IDENTITY = "-"（ad-hoc），
+          #    Runner target 的 Release 配置又写死 CODE_SIGN_STYLE = Automatic。
+          #    pbxproj 的优先级高于 xcconfig，只改 Release.xcconfig 不会生效 ——
+          #    这正是日志里出现 flags=0x10002(adhoc,runtime)、TeamIdentifier=not set 的原因。
+          PBX=macos/Runner.xcodeproj/project.pbxproj
+          sed -i '' -e "s|CODE_SIGN_IDENTITY = \"-\";|CODE_SIGN_IDENTITY = \"$CERT_IDENTITY\";|g" "$PBX"
+          sed -i '' -e 's|CODE_SIGN_STYLE = Automatic;|CODE_SIGN_STYLE = Manual;|g' "$PBX"
+          echo "=== pbxproj 中的签名配置 ==="
+          grep -nE 'CODE_SIGN_IDENTITY|CODE_SIGN_STYLE|DEVELOPMENT_TEAM|PROVISIONING_PROFILE_SPECIFIER' "$PBX"
+          if grep -q 'CODE_SIGN_IDENTITY = "-";' "$PBX"; then
+            echo "❌ pbxproj 仍存在 ad-hoc 签名配置，替换失败"
+            exit 1
+          fi
+
+          # 4) 官网直装版不启用沙箱：Developer ID 分发不以沙箱为前提，
+          #    而 Flutter 模板的 Release.entitlements 只开了 app-sandbox，
+          #    没有 network.client（联网）、audio-input（录音）等配套权限，
+          #    带沙箱发布会让这些功能全部静默失效。
+          ENT=macos/Runner/Release.entitlements
+          if [ -f "$ENT" ]; then
+            /usr/libexec/PlistBuddy -c "Delete :com.apple.security.app-sandbox" "$ENT" 2>/dev/null || true
+            echo "=== $ENT ==="
+            cat "$ENT"
+          fi
+
       - name: 🔨 编译 macOS App（Release，Developer ID 签名）
         working-directory: ./source-code/enjoychinese_app
         run: |
