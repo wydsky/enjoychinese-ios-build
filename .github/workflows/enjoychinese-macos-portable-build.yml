@@ -1,0 +1,577 @@
+name: EnjoyChinese macOS Build (官网下载 · Developer ID 签名 + 公证 DMG)
+
+# 用途：构建 EnjoyChinese macOS 桌面版（Flutter macos），以 Developer ID Application 证书签名、
+# 经 Apple 公证（notarization）并 staple，打成 DMG 供官网直接下载；同时上传为 Artifact，
+# 并在（配置 OPEN_API_* Secrets 后）通过开放接口自动上传 COS、在后端 app_version 表登记版本
+# （package_name = com.enjoychinese.app.macos）。
+#
+# 与 iOS workflow 的区别：
+#   - enjoychinese-ios-build.yml → App Store 分发（Apple Distribution + provisioning profile + altool 上传）
+#   - 本文件                     → 官网下载分发（Developer ID + 硬化运行时 + notarytool 公证）
+#   两者证书用途不同，不可混用；且各自维护独立的版本计数器。
+#
+# 与 enjoychinese-macos-build.yml 的区别（同属 macOS，注意别选错）：
+#   - 本文件（*-macos-portable-build.yml）→ 官网下载版（Developer ID + 公证 + DMG）
+#   - enjoychinese-macos-build.yml        → Mac App Store 上架版（Apple Distribution + pkg + altool）
+#   两者包名相同但分发渠道不同，版本计数器也相互独立。
+#
+# 需要的 Secrets：
+#   GITEE_TOKEN / PROD_API_HOST / GH_PAT / WECHAT_WORK_WEBHOOK_KEY
+#   ENJOYCHINESE_MACOS_DEV_ID_P12_BASE64      Developer ID Application 证书（.p12）的 base64
+#   ENJOYCHINESE_MACOS_DEV_ID_P12_PASSWORD    上述 p12 的导出密码
+#   APPLE_ID                     Apple 账号邮箱（公证用）
+#   APP_STORE_CONNECT_PASSWORD   App 专用密码（公证用，与 iOS 上传共用）
+#   APPLE_TEAM_ID                Team ID，缺省回退 JU3D9VJFCN
+#   REVENUECAT_APPLE_API_KEY     RevenueCat Apple 公钥（macOS 走 Apple 内购）
+#   OPEN_API_BASE_URL / OPEN_API_AK / OPEN_API_SK（未配置则跳过自动发布）
+
+on:
+  workflow_dispatch:
+
+# 同一平台的构建必须串行：并发运行会先后读到同一个计数器值，产生重复的构建号。
+# 跨平台之间不需要互斥 —— 各平台只读写自己的计数器文件。
+concurrency:
+  group: enjoychinese-macos-portable-build
+  cancel-in-progress: false
+
+jobs:
+  build-macos-portable:
+    runs-on: macos-26
+    name: 构建EnjoyChinese macOS 官网下载版（Developer ID + 公证 DMG）
+    permissions:
+      contents: read
+    env:
+      OPEN_API_BASE_URL: ${{ secrets.OPEN_API_BASE_URL }}
+      OPEN_API_AK: ${{ secrets.OPEN_API_AK }}
+      OPEN_API_SK: ${{ secrets.OPEN_API_SK }}
+      TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - name: 📋 Checkout 当前打包仓库
+        uses: actions/checkout@v4
+
+      - name: 🛠️ 自动检测并选择最新可用的 Xcode 版本
+        run: |
+          echo "=== 可用的 Xcode 版本 ==="
+          find /Applications -maxdepth 1 -type d -name "Xcode*.app" | sort -V
+          echo ""
+
+          AVAILABLE_XCODE=$(find /Applications -maxdepth 1 -type d -name "Xcode*.app" | sort -V | tail -1)
+          if [ -n "$AVAILABLE_XCODE" ]; then
+            echo "选择最新 Xcode: $AVAILABLE_XCODE"
+            sudo xcode-select -s "$AVAILABLE_XCODE/Contents/Developer"
+          else
+            echo "警告: 未找到 Xcode，使用默认配置"
+          fi
+
+          echo ""
+          echo "=== 当前 Xcode 版本 ==="
+          xcodebuild -version
+
+      - name: 📥 拉取私有Gitee Flutter代码
+        run: |
+          git clone -b client-release https://oauth2:${{ secrets.GITEE_TOKEN }}@gitee.com/yunhaninfo/enjoy-chinese.git source-code
+
+      - name: 🔢 Manage macOS Build Version
+        id: ver
+        working-directory: ./source-code
+        run: |
+          set -e
+          echo "========================================"
+          echo "🔢 Managing EnjoyChinese macOS Build Version"
+          echo "========================================"
+
+          # 版本名：只取 pubspec `version:` 中 `+` 之前的部分（跨平台统一，人工维护）。
+          # pubspec 的 `+N` 只是本地开发默认值，CI 既不读取也不回写 —— 构建号改由本平台
+          # 独立计数器维护，避免各平台互相推高版本号。
+          VERSION_NAME=$(grep "^version:" enjoychinese_app/pubspec.yaml | sed 's/version: *//' | cut -d+ -f1 | tr -d ' ')
+          if [ -z "$VERSION_NAME" ]; then
+            echo "❌ 无法从 pubspec.yaml 解析版本名"
+            exit 1
+          fi
+          echo "Version name: $VERSION_NAME"
+
+          # 本平台构建号计数器（部署仓库内，只由本 workflow 读写）
+          VERSION_TRACK_FILE=".github/deploy/version-enjoychinese-macos.txt"
+          VERSION_FILE="$GITHUB_WORKSPACE/$VERSION_TRACK_FILE"
+          if [ -f "$VERSION_FILE" ]; then
+            STORED_BUILD=$(cat "$VERSION_FILE" | tr -d ' \n')
+          else
+            STORED_BUILD="0"
+            echo "ℹ️  Version tracking file not found, initializing to 0"
+          fi
+          echo "Stored build number: $STORED_BUILD"
+
+          # 内容非法时直接失败，不静默兜底：否则会把版本号重置
+          case "$STORED_BUILD" in
+            ''|*[!0-9]*)
+              echo "❌ 计数器文件内容非法: '$STORED_BUILD'（$VERSION_TRACK_FILE）"
+              exit 1
+              ;;
+          esac
+
+          # 独立自增：只看本平台的历史值，与其他平台无关
+          NEW_BUILD=$((STORED_BUILD + 1))
+          echo "⬆️  Auto-incrementing: $STORED_BUILD → $NEW_BUILD"
+
+          # 延迟写入：这里只计算 N 并透传，不落盘、不提交。
+          # 计数器由后续「📌 结算构建版本号」步骤在产物上传成功后才写入；
+          # 任何阶段失败都不会消耗版本号，因此也无需回滚。
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          echo "build_number=$NEW_BUILD"   >> "$GITHUB_OUTPUT"
+
+      - name: 🚀 配置 Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.2'
+          channel: stable
+
+      - name: 💾 缓存依赖
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            ~/Library/Caches/CocoaPods
+            ./source-code/enjoychinese_app/.dart_tool
+            ./source-code/enjoychinese_app/build/macos/SourcePackages
+          key: ${{ runner.os }}-enjoychinese-macos-portable-flutter-${{ hashFiles('source-code/enjoychinese_app/pubspec.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-enjoychinese-macos-portable-flutter-
+
+      - name: 📦 安装项目依赖
+        working-directory: ./source-code/enjoychinese_app
+        run: flutter pub get
+
+      - name: 🏗️ 生成代码（json_serializable等）
+        working-directory: ./source-code/enjoychinese_app
+        run: dart run build_runner build --delete-conflicting-outputs
+
+      - name: 🔑 导入 Developer ID 签名证书
+        # 手动建 keychain：后续要用同一个 keychain 里的身份给 .app / .dmg 签名，
+        # import-codesign-certs 内部生成的密码拿不到，无法保证 codesign 能取到私钥。
+        run: |
+          set -euo pipefail
+          KEYCHAIN_NAME="signing_temp.keychain"
+          KEYCHAIN_FILE="$HOME/Library/Keychains/$KEYCHAIN_NAME"
+          KEYCHAIN_PW="$(uuidgen)"
+
+          echo "=== 创建签名 keychain ==="
+          rm -f "$KEYCHAIN_FILE" "$KEYCHAIN_FILE-db"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN_FILE"
+          # 关闭自动锁定，避免长构建后签名时 keychain 已锁
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_FILE"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN_FILE"
+
+          echo "=== 导入 Developer ID Application 证书 ==="
+          printf '%s' "$ENJOYCHINESE_MACOS_DEV_ID_P12_BASE64" | base64 -d > /tmp/dev_id.p12
+          security import /tmp/dev_id.p12 \
+            -k "$KEYCHAIN_FILE" \
+            -P "$ENJOYCHINESE_MACOS_DEV_ID_P12_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          rm -f /tmp/dev_id.p12
+
+          # 给私钥补 ACL，否则 codesign 调用时会弹授权框导致构建卡死
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PW" "$KEYCHAIN_FILE"
+
+          # 把临时 keychain 挂到搜索列表首位（不删除原有项）
+          security list-keychains -d user -s "$KEYCHAIN_FILE" $(security list-keychains -d user | tr -d '"')
+
+          echo "=== 已安装的签名身份 ==="
+          security find-identity -v -p codesigning
+
+          CERT=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ -z "$CERT" ]; then
+            echo "❌ 未在 keychain 中找到 Developer ID Application 证书"
+            exit 1
+          fi
+          echo "签名身份: $CERT"
+          echo "cert_identity=$CERT" >> "$GITHUB_OUTPUT"
+        id: cert
+        env:
+          ENJOYCHINESE_MACOS_DEV_ID_P12_BASE64: ${{ secrets.ENJOYCHINESE_MACOS_DEV_ID_P12_BASE64 }}
+          ENJOYCHINESE_MACOS_DEV_ID_P12_PASSWORD: ${{ secrets.ENJOYCHINESE_MACOS_DEV_ID_P12_PASSWORD }}
+
+      - name: ✏️ 配置 Bundle ID 与 Developer ID 签名（含硬化运行时）
+        working-directory: ./source-code/enjoychinese_app
+        env:
+          CERT_IDENTITY: ${{ steps.cert.outputs.cert_identity }}
+        run: |
+          set -e
+          # 1) Bundle ID 统一为 com.enjoychinese.app（与后端登记、官网下载项一致）
+          perl -i -pe 's/PRODUCT_BUNDLE_IDENTIFIER = .*/PRODUCT_BUNDLE_IDENTIFIER = com.enjoychinese.app;/' \
+            macos/Runner/Configs/AppInfo.xcconfig
+          echo "=== AppInfo.xcconfig ==="
+          cat macos/Runner/Configs/AppInfo.xcconfig
+
+          # 2) Release 构建配置写入 Developer ID 签名设置
+          #    公证要求「硬化运行时 + 安全时间戳」，否则 notarytool 会以 Invalid 拒收。
+          XC=macos/Runner/Configs/Release.xcconfig
+          # 先清掉可能残留的签名相关行，避免同一个 key 出现两次、后写的被 Xcode 忽略
+          perl -i -ne 'print unless /^\s*(CODE_SIGN_STYLE|CODE_SIGN_IDENTITY|DEVELOPMENT_TEAM|ENABLE_HARDENED_RUNTIME|OTHER_CODE_SIGN_FLAGS)\s*=/' "$XC"
+
+          TEAM="${TEAM_ID:-JU3D9VJFCN}"
+          if [ -z "$CERT_IDENTITY" ]; then
+            echo "❌ 未取到 Developer ID 签名身份，无法写入发布签名配置"
+            exit 1
+          fi
+          {
+            echo "CODE_SIGN_STYLE = Manual"
+            echo "DEVELOPMENT_TEAM = $TEAM"
+            echo "CODE_SIGN_IDENTITY = \"$CERT_IDENTITY\""
+            echo "ENABLE_HARDENED_RUNTIME = YES"
+            echo "OTHER_CODE_SIGN_FLAGS = --timestamp"
+          } >> "$XC"
+          echo "=== Release.xcconfig ==="
+          cat "$XC"
+
+      - name: 🔨 编译 macOS App（Release，Developer ID 签名）
+        working-directory: ./source-code/enjoychinese_app
+        run: |
+          echo "=== 开始构建 EnjoyChinese macOS App ==="
+          # CFBundleVersion 由 --build-number 决定，构建号来自本平台独立计数器
+          # 说明 1：不注入 DIST_CHANNEL=direct —— 应用内升级服务（app_update_service）用
+          #   packageInfo.packageName 查询版本，macOS 上该值等于 Bundle ID com.enjoychinese.app，
+          #   会命中 Android 官网包并提示下载 APK；桌面版统一走官网下载页更新。
+          # 说明 2：REVENUECAT_API_KEY 与 iOS 共用同一把 Apple 公钥。
+          flutter build macos \
+            --release \
+            --build-number=${{ steps.ver.outputs.build_number }} \
+            --dart-define=ENV=prod \
+            --dart-define=PROD_API_HOST=${{ secrets.PROD_API_HOST }} \
+            --dart-define=REVENUECAT_API_KEY=${{ secrets.REVENUECAT_APPLE_API_KEY }}
+          echo ""
+          echo "=== macOS App 构建完成 ==="
+
+      - name: ✅ 校验产物（Bundle ID / 版本号 / 签名 / 硬化运行时）
+        id: verify
+        working-directory: ./source-code/enjoychinese_app
+        env:
+          CERT_IDENTITY: ${{ steps.cert.outputs.cert_identity }}
+        run: |
+          set -e
+          # 产物名取决于 PRODUCT_NAME（可能被客户仓库改成 EnjoyChinese），这里按扩展名反查，
+          # 避免路径写死导致改名后整条流水线失败。
+          APP_PATH=$(find build/macos/Build/Products/Release -maxdepth 1 -name "*.app" -type d 2>/dev/null | head -1 || true)
+          if [ -z "$APP_PATH" ]; then
+            echo "❌ build/macos/Build/Products/Release 下未找到 .app"
+            ls -la build/macos/Build/Products/Release/ || true
+            exit 1
+          fi
+          echo "产物路径: $APP_PATH"
+          echo "app_path=$APP_PATH" >> "$GITHUB_OUTPUT"
+
+          echo "=== 产物大小 ==="
+          du -sh "$APP_PATH"
+
+          INFO="$APP_PATH/Contents/Info.plist"
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$INFO")
+          SHORT_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$INFO")
+          BUILD_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$INFO")
+          echo "Bundle ID: $BUNDLE_ID"
+          echo "CFBundleShortVersionString: $SHORT_VERSION"
+          echo "CFBundleVersion:            $BUILD_VERSION"
+
+          [ "$BUNDLE_ID" = "com.enjoychinese.app" ] || { echo "❌ Bundle ID 期望 com.enjoychinese.app"; exit 1; }
+          # 断言产物真的带上了本平台计数器号，兜住 "--build-number 被忽略/被工程配置覆盖" 这类静默失效
+          [ "$BUILD_VERSION" = "${{ steps.ver.outputs.build_number }}" ] || {
+            echo "❌ CFBundleVersion=$BUILD_VERSION，期望 ${{ steps.ver.outputs.build_number }}"; exit 1; }
+          [ "$SHORT_VERSION" = "${{ steps.ver.outputs.version_name }}" ] || {
+            echo "❌ CFBundleShortVersionString=$SHORT_VERSION，期望 ${{ steps.ver.outputs.version_name }}"; exit 1; }
+
+          echo ""
+          echo "=== 签名信息 ==="
+          codesign -dv --verbose=4 "$APP_PATH" 2>&1 | grep -E "Identifier|TeamIdentifier|Authority|flags" | head -10
+          codesign --verify --deep --strict "$APP_PATH"
+
+          # 公证前置条件：必须是 Developer ID 签名 + 硬化运行时（flags 里出现 runtime）
+          SIGN_INFO=$(codesign -dv --verbose=4 "$APP_PATH" 2>&1)
+          echo "$SIGN_INFO" | grep -q "Developer ID Application" || {
+            echo "❌ 产物不是 Developer ID 签名，公证会失败"; exit 1; }
+          if ! echo "$SIGN_INFO" | grep -q "flags=.*runtime"; then
+            echo "⚠️  未检测到硬化运行时标志，补签一次以开启 runtime"
+            codesign -d --entitlements :- "$APP_PATH" > /tmp/app_entitlements.plist 2>/dev/null || true
+            if [ -s /tmp/app_entitlements.plist ]; then
+              codesign --force --deep --options runtime --timestamp \
+                --entitlements /tmp/app_entitlements.plist \
+                --sign "$CERT_IDENTITY" "$APP_PATH"
+            else
+              codesign --force --deep --options runtime --timestamp --sign "$CERT_IDENTITY" "$APP_PATH"
+            fi
+            codesign --verify --deep --strict "$APP_PATH"
+            codesign -dv --verbose=4 "$APP_PATH" 2>&1 | grep -E "Authority|flags" | head -5
+          fi
+          echo "✅ 签名校验通过"
+
+      - name: 💿 生成并签名 DMG
+        id: dmg
+        working-directory: ./source-code/enjoychinese_app
+        env:
+          CERT_IDENTITY: ${{ steps.cert.outputs.cert_identity }}
+        run: |
+          set -e
+          APP_PATH="${{ steps.verify.outputs.app_path }}"
+          RELEASE_DIR="build/macos/release"
+          mkdir -p "$RELEASE_DIR"
+
+          VERSION_NAME="${{ steps.ver.outputs.version_name }}"
+          BUILD_NUMBER="${{ steps.ver.outputs.build_number }}"
+          DMG_NAME="EnjoyChinese-$VERSION_NAME.$BUILD_NUMBER.dmg"
+          DMG_PATH="$RELEASE_DIR/$DMG_NAME"
+
+          # 暂存目录里给用户看到的是 EnjoyChinese.app（改的是 .app 目录名，不影响内部签名）
+          STAGE="$RELEASE_DIR/dmg_stage"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
+          ditto "$APP_PATH" "$STAGE/EnjoyChinese.app"
+          ln -s /Applications "$STAGE/Applications"
+
+          hdiutil create -volname "EnjoyChinese $VERSION_NAME" \
+            -srcfolder "$STAGE" -ov -format UDZO "$DMG_PATH"
+
+          echo "=== DMG 签名 ==="
+          codesign --force --timestamp --sign "$CERT_IDENTITY" "$DMG_PATH"
+          codesign --verify --verbose=2 "$DMG_PATH"
+
+          echo "✅ 已生成 DMG: $DMG_PATH ($(du -h "$DMG_PATH" | cut -f1))"
+          echo "dmg_name=$DMG_NAME" >> "$GITHUB_OUTPUT"
+          echo "dmg_path=$DMG_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: 🧾 提交 Apple 公证并 staple
+        working-directory: ./source-code/enjoychinese_app
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APP_STORE_CONNECT_PASSWORD: ${{ secrets.APP_STORE_CONNECT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          TEAM="${TEAM_ID:-JU3D9VJFCN}"
+          DMG_PATH="${{ steps.dmg.outputs.dmg_path }}"
+          APP_PATH="${{ steps.verify.outputs.app_path }}"
+
+          echo "=== 提交公证（notarytool，异步返回后等待结果） ==="
+          xcrun notarytool submit "$DMG_PATH" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$TEAM" \
+            --password "$APP_STORE_CONNECT_PASSWORD" \
+            --wait \
+            --output-format json > /tmp/notary_result.json
+
+          cat /tmp/notary_result.json
+          NOTARY_STATUS=$(jq -r '.status // "Unknown"' /tmp/notary_result.json)
+          NOTARY_ID=$(jq -r '.id // ""' /tmp/notary_result.json)
+          echo "公证 ID: $NOTARY_ID，状态: $NOTARY_STATUS"
+
+          if [ "$NOTARY_STATUS" != "Accepted" ]; then
+            echo "❌ 公证未通过，输出日志："
+            xcrun notarytool log "$NOTARY_ID" \
+              --apple-id "$APPLE_ID" \
+              --team-id "$TEAM" \
+              --password "$APP_STORE_CONNECT_PASSWORD" || true
+            exit 1
+          fi
+
+          echo "=== staple 公证票据 ==="
+          xcrun stapler staple "$DMG_PATH"
+          xcrun stapler validate "$DMG_PATH"
+          # 票根对 DMG 内的 app 同样有效（同一份公证提交已包含其 cdhash），
+          # 一并 staple，这样从 zip 解压的 .app 离线首启也不会被 Gatekeeper 拦。
+          xcrun stapler staple "$APP_PATH" || echo "⚠️  app staple 未成功（DMG 已完成公证，不影响官网分发）"
+
+          echo "=== Gatekeeper 评估（仅展示，不作为失败条件）==="
+          spctl -a -vvv -t exec "$APP_PATH" || true
+          spctl -a -t open --context context:primary-signature -v "$DMG_PATH" || true
+          echo "✅ 公证与 staple 完成"
+
+      - name: 🗜️ 打包已公证的 .app（zip，备用下载）
+        working-directory: ./source-code/enjoychinese_app
+        run: |
+          set -e
+          APP_PATH="${{ steps.verify.outputs.app_path }}"
+          RELEASE_DIR="build/macos/release"
+          mkdir -p "$RELEASE_DIR"
+          ZIP_PATH="$RELEASE_DIR/EnjoyChinese-${{ steps.ver.outputs.version_name }}.${{ steps.ver.outputs.build_number }}.zip"
+          ditto -c -k --rsrc --keepParent "$APP_PATH" "$ZIP_PATH"
+          echo "✅ 已生成 zip: $ZIP_PATH ($(du -h "$ZIP_PATH" | cut -f1))"
+
+      - name: 📦 上传Artifact（备份 / 未配置开放接口时手工发布）
+        uses: actions/upload-artifact@v4
+        with:
+          name: enjoychinese-prod-macos
+          path: |
+            ./source-code/enjoychinese_app/build/macos/release/*.dmg
+            ./source-code/enjoychinese_app/build/macos/release/*.zip
+          if-no-files-found: error
+          retention-days: 90
+
+      # publish-apk-open-api.sh 依赖 coreutils 的 sha256sum/md5sum，macOS runner 默认没有；
+      # 用 shasum / md5 做同名薄封装，避免为一个校验和引入 brew 安装。
+      - name: 🔧 补 sha256sum / md5sum 命令
+        run: |
+          set -e
+          sudo mkdir -p /usr/local/bin
+          printf '#!/bin/bash\nexec shasum -a 256 "$@"\n' | sudo tee /usr/local/bin/sha256sum >/dev/null
+          printf '#!/bin/bash\nexec md5 -r "$@"\n' | sudo tee /usr/local/bin/md5sum >/dev/null
+          sudo chmod +x /usr/local/bin/sha256sum /usr/local/bin/md5sum
+          sha256sum /etc/hosts | head -1
+          md5sum /etc/hosts | head -1
+
+      # 通过开放接口（AK/SK 签名）完成「上传安装包 → 登记 app_version」，
+      # 官网下载页随即可见。必须在结算构建号之前执行：发布失败则计数器不落盘，
+      # 下次构建会重试同一个版本号。
+      - name: 🌐 发布到官网（开放接口）
+        run: |
+          if [ -z "${OPEN_API_BASE_URL:-}" ] || [ -z "${OPEN_API_AK:-}" ] || [ -z "${OPEN_API_SK:-}" ]; then
+            echo "::notice::未配置 OPEN_API_BASE_URL/OPEN_API_AK/OPEN_API_SK，跳过自动发布（仍可用 Artifact 手工发布）"
+            exit 0
+          fi
+          bash "deploy/ios-android-build/scripts/publish-apk-open-api.sh" \
+            "source-code/enjoychinese_app/build/macos/release/${{ steps.dmg.outputs.dmg_name }}" \
+            "com.enjoychinese.app.macos" \
+            "EnjoyChinese" \
+            "${{ steps.ver.outputs.version_name }}" \
+            "${{ steps.ver.outputs.build_number }}" \
+            "macOS 官网版 ${{ steps.ver.outputs.version_name }}"
+
+      - name: 📌 结算构建版本号
+        shell: bash
+        run: |
+          set -e
+          BUILD_NUMBER="${{ steps.ver.outputs.build_number }}"
+          VERSION_TRACK_FILE=".github/deploy/version-enjoychinese-macos.txt"
+          echo "========================================"
+          echo "📌 结算构建版本号（产物已上传成功）"
+          echo "========================================"
+          echo "待写入计数器: $VERSION_TRACK_FILE = $BUILD_NUMBER"
+
+          COMMIT_MSG="chore: update EnjoyChinese macOS build version tracking to $BUILD_NUMBER [skip ci]"
+          # 用 printf | base64 | tr 而非 base64 -w 0：BSD base64（macOS runner）不支持 -w
+          ENCODED_CONTENT=$(printf '%s' "$BUILD_NUMBER" | base64 | tr -d '\n')
+          API_URL="https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/${VERSION_TRACK_FILE}"
+
+          # 读当前 SHA：文件已存在时 PUT 必须带 sha，否则 GitHub 返回 409
+          FILE_SHA=""
+          HTTP_CODE=$(curl -s -o /tmp/api_response.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${GH_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            "$API_URL")
+          if [ "$HTTP_CODE" = "200" ]; then
+            FILE_SHA=$(jq -r '.sha' /tmp/api_response.json)
+            echo "Existing file SHA: $FILE_SHA"
+          else
+            echo "ℹ️  计数器文件尚不存在（HTTP $HTTP_CODE），将新建"
+          fi
+
+          if [ -n "$FILE_SHA" ]; then
+            JSON_BODY=$(jq -n \
+              --arg msg "$COMMIT_MSG" \
+              --arg content "$ENCODED_CONTENT" \
+              --arg sha "$FILE_SHA" \
+              '{message: $msg, content: $content, sha: $sha}')
+          else
+            JSON_BODY=$(jq -n \
+              --arg msg "$COMMIT_MSG" \
+              --arg content "$ENCODED_CONTENT" \
+              '{message: $msg, content: $content}')
+          fi
+
+          # 重试 3 次：artifact 已生成，此处失败会让该编号下次被复用，必须尽力成功
+          SUCCESS=0
+          for attempt in 1 2 3; do
+            UPDATE_CODE=$(curl -s -o /tmp/update_response.json -w "%{http_code}" \
+              -X PUT \
+              -H "Authorization: Bearer ${GH_PAT}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Content-Type: application/json" \
+              -d "$JSON_BODY" \
+              "$API_URL")
+            if [ "$UPDATE_CODE" = "200" ] || [ "$UPDATE_CODE" = "201" ]; then
+              SUCCESS=1
+              break
+            fi
+            echo "⚠️  写入失败（第 $attempt 次，HTTP $UPDATE_CODE）"
+            cat /tmp/update_response.json || true
+            sleep $((attempt * 3))
+          done
+
+          if [ "$SUCCESS" != "1" ]; then
+            echo ""
+            echo "❌❌❌ 严重：产物已成功上传，但版本计数器写入失败！"
+            echo "    请立即手动把 $VERSION_TRACK_FILE 的内容改为 $BUILD_NUMBER，"
+            echo "    否则下次构建会复用该版本号。"
+            exit 1
+          fi
+
+          echo ""
+          echo "========================================"
+          echo "✅ Version Management Complete: ${{ steps.ver.outputs.version_name }}+$BUILD_NUMBER"
+          echo "========================================"
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+
+      - name: 📊 构建结果报告
+        run: |
+          echo "========================================"
+          echo "🎉 EnjoyChinese macOS 官网下载版（Developer ID + 公证）构建完成"
+          echo "========================================"
+          echo "状态: ✅ 成功"
+          echo "Runner: ${{ runner.os }}"
+          echo "Xcode: $(xcodebuild -version | head -1)"
+          echo "Flutter: $(flutter --version | head -1)"
+          echo "Bundle ID: com.enjoychinese.app"
+          echo ""
+          echo "版本名:   ${{ steps.ver.outputs.version_name }}"
+          echo "构建号:   ${{ steps.ver.outputs.build_number }}（本平台独立计数器，与 Android/iOS/Windows 无关）"
+          echo "DMG:      ${{ steps.dmg.outputs.dmg_name }}"
+          echo ""
+          echo "Artifact: enjoychinese-prod-macos"
+          echo "取件方式："
+          echo "  gh run download ${{ github.run_id }} --repo ${{ github.repository }} -n enjoychinese-prod-macos -D ./dist"
+          echo ""
+          echo "若已配置 OPEN_API_* Secrets，DMG 已自动上传并发布到官网（package_name = com.enjoychinese.app.macos）；"
+          echo "若未配置（发布步骤被跳过），请手工上传 DMG 并在后端登记版本，versionCode 填 ${{ steps.ver.outputs.build_number }}。"
+          echo "========================================"
+
+  # ============================================================
+  # 企业微信通知：成功 / 失败都推送，与其他构建 workflow 保持一致。
+  # Webhook key 来自 Secrets.WECHAT_WORK_WEBHOOK_KEY；未配置时仅通知缺失，不影响构建结果。
+  # ============================================================
+  notify:
+    needs: build-macos-portable
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify success
+        if: needs.build-macos-portable.result == 'success'
+        run: |
+          MESSAGE="✅ EnjoyChinese macOS 官网下载版（Developer ID + 公证 DMG） 构建成功
+
+          App: com.enjoychinese.app.macos
+          Commit: ${{ github.sha }}
+          Branch: ${{ github.ref_name }}
+
+          View: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          jq -n --arg content "$MESSAGE" '{
+            msgtype: "text",
+            text: { content: $content }
+          }' > /tmp/wechat_msg.json
+          curl -s -X POST "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=${{ secrets.WECHAT_WORK_WEBHOOK_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d @/tmp/wechat_msg.json
+
+      - name: Notify failure
+        if: needs.build-macos-portable.result == 'failure'
+        run: |
+          MESSAGE="❌ EnjoyChinese macOS 官网下载版（Developer ID + 公证 DMG） 构建失败
+
+          App: com.enjoychinese.app.macos
+          Commit: ${{ github.sha }}
+          Branch: ${{ github.ref_name }}
+
+          Check: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          jq -n --arg content "$MESSAGE" '{
+            msgtype: "text",
+            text: { content: $content }
+          }' > /tmp/wechat_msg.json
+          curl -s -X POST "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=${{ secrets.WECHAT_WORK_WEBHOOK_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d @/tmp/wechat_msg.json
