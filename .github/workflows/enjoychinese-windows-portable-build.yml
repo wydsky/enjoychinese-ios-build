@@ -27,7 +27,14 @@ concurrency:
 
 jobs:
   build-windows-portable:
-    runs-on: windows-latest
+    # 固定在 windows-2022，不要用 windows-latest。
+    # windows-latest 已切到 Windows Server 2025，镜像里同时装了 Visual Studio 18（2026），
+    # Flutter/CMake 会挑中「最新」的 VS 实例，但该实例的 MSVC 工具集（14.51.36231）
+    # 在镜像中并不存在，于是报
+    #   The CMAKE_CXX_COMPILER: .../VS/18/Enterprise/VC/Tools/MSVC/14.51.36231/.../cl.exe
+    #   is not a full path to an existing compiler tool
+    # windows-2022 只带 VS 2022（MSVC 14.4x），工具链稳定。
+    runs-on: windows-2022
     name: 构建EnjoyChinese Windows便携版（Inno Setup 安装包，供官网下载）
     permissions:
       contents: read
@@ -130,9 +137,12 @@ jobs:
             ./source-code/enjoychinese_app/build/windows
           # key 里带 cmake331：上一轮用 CMake 4 配置失败时生成的 build/windows 缓存
           # （含 CMakeCache.txt）不能复用，换个键让它重新生成
-          key: ${{ runner.os }}-enjoychinese-windows-portable-flutter-cmake331-${{ hashFiles('source-code/enjoychinese_app/pubspec.lock') }}
+          # key 里带 vs2022：缓存目录含 CMakeCache.txt，里面写死了 VS 实例与 cl.exe 的
+          # 绝对路径。之前失败的构建可能已把 VS 18 的路径写进缓存，必须换键让它重新生成，
+          # 否则即使换了 runner，CMake 仍会去用旧的 14.51 编译器路径。
+          key: ${{ runner.os }}-enjoychinese-windows-portable-flutter-cmake331-vs2022-${{ hashFiles('source-code/enjoychinese_app/pubspec.lock') }}
           restore-keys: |
-            ${{ runner.os }}-enjoychinese-windows-portable-flutter-cmake331-
+            ${{ runner.os }}-enjoychinese-windows-portable-flutter-cmake331-vs2022-
 
       - name: 📦 安装项目依赖
         working-directory: ./source-code/enjoychinese_app
