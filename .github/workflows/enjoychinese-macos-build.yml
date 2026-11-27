@@ -217,8 +217,8 @@ jobs:
           echo "将使用 Provisioning Profile: $PROV_NAME"
 
           # 1) bundle id 统一为 com.enjoychinese.app（与 ASC 中 iOS/macOS 同记录一致）
-          if ! grep -q 'PRODUCT_BUNDLE_IDENTIFIER = com.enjoychinese.app;' macos/Runner/Configs/AppInfo.xcconfig; then
-            perl -i -pe 's/PRODUCT_BUNDLE_IDENTIFIER = .*/PRODUCT_BUNDLE_IDENTIFIER = com.enjoychinese.app;/' macos/Runner/Configs/AppInfo.xcconfig
+          if ! grep -q 'PRODUCT_BUNDLE_IDENTIFIER = com.enjoychinese.app' macos/Runner/Configs/AppInfo.xcconfig; then
+            perl -i -pe 's/PRODUCT_BUNDLE_IDENTIFIER = .*/PRODUCT_BUNDLE_IDENTIFIER = com.enjoychinese.app/' macos/Runner/Configs/AppInfo.xcconfig
           fi
           echo "=== AppInfo.xcconfig Bundle ID ==="
           grep PRODUCT_BUNDLE_IDENTIFIER macos/Runner/Configs/AppInfo.xcconfig
@@ -307,7 +307,7 @@ jobs:
         working-directory: ./source-code/enjoychinese_app
         run: |
           set -e
-          APP_PATH="build/macos/Build/Products/Release/enjoychinese_app.app"
+          APP_PATH="build/macos/Build/Products/Release/EnjoyChinese.app"
           if [ ! -d "$APP_PATH" ]; then
             echo "❌ 未找到产物: $APP_PATH"
             ls -la build/macos/Build/Products/Release/ || true
@@ -383,7 +383,7 @@ jobs:
         working-directory: ./source-code/enjoychinese_app
         run: |
           set -e
-          APP_PATH="build/macos/Build/Products/Release/enjoychinese_app.app"
+          APP_PATH="build/macos/Build/Products/Release/EnjoyChinese.app"
           RELEASE_DIR="build/macos/release"
           mkdir -p "$RELEASE_DIR"
           # Mac App Store 不接受直接上传 .app 目录（报 90268/90259/90270/90267），
@@ -490,11 +490,11 @@ jobs:
         working-directory: ./source-code/enjoychinese_app
         run: |
           set -e
-          APP_PATH="build/macos/Build/Products/Release/enjoychinese_app.app"
+          APP_PATH="build/macos/Build/Products/Release/EnjoyChinese.app"
           RELEASE_DIR="build/macos/release"
           mkdir -p "$RELEASE_DIR"
-          ditto -c -k --rsrc --keepParent "$APP_PATH" "$RELEASE_DIR/enjoychinese_app.app.zip"
-          echo "已生成 zip: $RELEASE_DIR/enjoychinese_app.app.zip ($(du -h "$RELEASE_DIR/enjoychinese_app.app.zip" | cut -f1))"
+          ditto -c -k --rsrc --keepParent "$APP_PATH" "$RELEASE_DIR/EnjoyChinese.app.zip"
+          echo "已生成 zip: $RELEASE_DIR/EnjoyChinese.app.zip ($(du -h "$RELEASE_DIR/EnjoyChinese.app.zip" | cut -f1))"
 
       - name: 📦 上传 Artifact
         uses: actions/upload-artifact@v4
